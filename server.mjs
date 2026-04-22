@@ -19,6 +19,7 @@ const TARGET_PROPERTY_ID = process.env.CLOUDBEDS_PROPERTY_ID ?? "";
 const TARGET_PROPERTY_NAME = process.env.CLOUDBEDS_PROPERTY_NAME ?? "Berlin Encore";
 const API_KEY = process.env.CLOUDBEDS_API_KEY ?? "";
 const WRITES_ENABLED = String(process.env.ENABLE_CLOUDBEDS_WRITES ?? "").toLowerCase() === "true";
+const MAX_FETCH_DAYS = Number(process.env.MAX_FETCH_DAYS ?? "45");
 const MAX_DRAFT_DAYS = Number(process.env.MAX_DRAFT_DAYS ?? "1");
 const MAX_DRAFT_CHANGES = Number(process.env.MAX_DRAFT_CHANGES ?? "20");
 const MAX_APPLY_CHANGES = Number(process.env.MAX_APPLY_CHANGES ?? "20");
@@ -57,16 +58,47 @@ function assertDate(value, label) {
   }
 }
 
+function dateToUtc(dateText) {
+  return new Date(`${dateText}T00:00:00Z`);
+}
+
 function daySpan(startDate, endDate) {
-  return Math.round((new Date(`${endDate}T00:00:00Z`) - new Date(`${startDate}T00:00:00Z`)) / 86400000);
+  return Math.round((dateToUtc(endDate) - dateToUtc(startDate)) / 86400000);
+}
+
+function inclusiveNightCount(startDate, endDate) {
+  return daySpan(startDate, nextDay(endDate));
 }
 
 function assertBatchScope(startDate, endDate, label = "Batch") {
-  const days = daySpan(startDate, endDate);
-  if (days <= 0) throw new Error("endDate must be after startDate.");
+  const days = inclusiveNightCount(startDate, endDate);
+  if (days <= 0) throw new Error("endDate must be on or after startDate.");
   if (days > MAX_DRAFT_DAYS) {
-    throw new Error(`${label} spans ${days} days; current limit is ${MAX_DRAFT_DAYS}.`);
+    throw new Error(`${label} spans ${days} nights; current limit is ${MAX_DRAFT_DAYS}.`);
   }
+}
+
+function assertFetchScope(startDate, endDate) {
+  const days = inclusiveNightCount(startDate, endDate);
+  if (days <= 0) throw new Error("endDate must be on or after startDate.");
+  if (days > MAX_FETCH_DAYS) {
+    throw new Error(`Fetch spans ${days} nights; current limit is ${MAX_FETCH_DAYS}.`);
+  }
+}
+
+function enumerateNights(startDate, endDate) {
+  assertDate(startDate, "startDate");
+  assertDate(endDate, "endDate");
+  assertFetchScope(startDate, endDate);
+  const nights = [];
+  const cursor = dateToUtc(startDate);
+  const last = dateToUtc(endDate);
+  while (cursor <= last) {
+    const date = cursor.toISOString().slice(0, 10);
+    nights.push({ date, checkoutDate: nextDay(date) });
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  return nights;
 }
 
 function nextDay(dateText) {
@@ -81,6 +113,14 @@ function smoothRate(rate) {
 
 function money(value) {
   return Number(Number(value).toFixed(2));
+}
+
+function ratesEqual(left, right) {
+  return Math.abs(money(left) - money(right)) < 0.005;
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function ensureDataDirs() {
@@ -176,37 +216,51 @@ async function readJson(filePath) {
 
 async function cloudbeds(method, params = {}, init = {}) {
   requireConfig();
-  const url = new URL(`${CLOUDBEDS_BASE_URL}/${method}`);
+  const requestMethod = (init.method ?? "GET").toUpperCase();
   const headers = { "x-api-key": API_KEY, ...(init.headers ?? {}) };
 
-  let response;
-  if ((init.method ?? "GET").toUpperCase() === "POST") {
-    const body = new URLSearchParams();
-    for (const [key, value] of Object.entries(params)) {
-      if (value !== undefined && value !== null) body.set(key, String(value));
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const url = new URL(`${CLOUDBEDS_BASE_URL}/${method}`);
+    let response;
+    if (requestMethod === "POST") {
+      const body = new URLSearchParams();
+      for (const [key, value] of Object.entries(params)) {
+        if (value !== undefined && value !== null) body.set(key, String(value));
+      }
+      response = await fetch(url, {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/x-www-form-urlencoded" },
+        body,
+      });
+    } else {
+      for (const [key, value] of Object.entries(params)) {
+        if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
+      }
+      response = await fetch(url, { headers });
     }
-    response = await fetch(url, {
-      method: "POST",
-      headers: { ...headers, "content-type": "application/x-www-form-urlencoded" },
-      body,
-    });
-  } else {
-    for (const [key, value] of Object.entries(params)) {
-      if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
+
+    const text = await response.text();
+    const json = text ? JSON.parse(text) : {};
+    const message = json.message ?? json.error ?? `Cloudbeds HTTP ${response.status}`;
+    const rateLimited = response.status === 429 || /rate limit/i.test(String(message));
+
+    if (response.ok && json.success !== false) return json;
+    if (requestMethod === "GET" && rateLimited && attempt < 4) {
+      await wait(1000 * 2 ** attempt);
+      continue;
     }
-    response = await fetch(url, { headers });
+    throw new Error(message);
   }
 
-  const text = await response.text();
-  const json = text ? JSON.parse(text) : {};
-  if (!response.ok) throw new Error(json.message ?? json.error ?? `Cloudbeds HTTP ${response.status}`);
-  if (json.success === false) throw new Error(json.message ?? json.error ?? "Cloudbeds rejected request.");
-  return json;
+  throw new Error("Cloudbeds request failed after retries.");
 }
 
-async function fetchRatePlans(startDate, endDate) {
-  const json = await cloudbeds("getRatePlans", { startDate, endDate });
+async function fetchRatePlansForNight(date, checkoutDate) {
+  const json = await cloudbeds("getRatePlans", { startDate: date, endDate: checkoutDate });
   const rows = (json.data ?? []).map((row) => ({
+    date,
+    startDate: date,
+    endDate: checkoutDate,
     rateID: String(row.rateID),
     roomTypeID: String(row.roomTypeID ?? ""),
     roomTypeName: String(row.roomTypeName ?? ""),
@@ -220,6 +274,28 @@ async function fetchRatePlans(startDate, endDate) {
   }));
 
   return { raw: json, rows };
+}
+
+async function fetchRatePlans(startDate, endDate) {
+  const nights = enumerateNights(startDate, endDate);
+  const nightlyResults = [];
+  for (const night of nights) {
+    nightlyResults.push(await fetchRatePlansForNight(night.date, night.checkoutDate));
+    if (nights.length > 1) await wait(250);
+  }
+  return {
+    raw: {
+      success: true,
+      startDate,
+      endDate,
+      nights: nightlyResults.map((result, index) => ({
+        date: nights[index].date,
+        checkoutDate: nights[index].checkoutDate,
+        response: result.raw,
+      })),
+    },
+    rows: nightlyResults.flatMap((result) => result.rows),
+  };
 }
 
 function targetRowsForDraft(rows) {
@@ -240,8 +316,9 @@ async function createDraft({ startDate, endDate, operator = "local", notes = "" 
         rateID: row.rateID,
         roomTypeID: row.roomTypeID,
         roomTypeName: row.roomTypeName,
-        startDate,
-        endDate,
+        date: row.date,
+        startDate: row.startDate,
+        endDate: row.endDate,
         currentRate: row.currentRate,
         proposedRate,
         changed: proposedRate !== row.currentRate,
@@ -287,8 +364,9 @@ async function createDraft({ startDate, endDate, operator = "local", notes = "" 
     rollbackChanges: changes.map((change) => ({
       rateID: change.rateID,
       roomTypeName: change.roomTypeName,
-      startDate,
-      endDate,
+      date: change.date,
+      startDate: change.startDate,
+      endDate: change.endDate,
       restoreRate: change.currentRate,
       expectedCurrentRate: change.proposedRate,
     })),
@@ -308,6 +386,7 @@ async function createDraft({ startDate, endDate, operator = "local", notes = "" 
       changeCount: changes.length,
       hash,
       notes,
+      maxFetchDays: MAX_FETCH_DAYS,
       maxDraftDays: MAX_DRAFT_DAYS,
       maxDraftChanges: MAX_DRAFT_CHANGES,
     },
@@ -369,11 +448,12 @@ async function createRollbackDraftFromBackup(id, operator = "local") {
   assertBatchScope(sourceBackup.startDate, sourceBackup.endDate, "Rollback draft");
   const fetched = await fetchRatePlans(sourceBackup.startDate, sourceBackup.endDate);
   const changes = sourceBackup.rollbackChanges.map((rollback) => {
-    const liveRow = fetched.rows.find((row) => row.rateID === rollback.rateID);
+    const liveRow = fetched.rows.find((row) => row.rateID === rollback.rateID && row.date === (rollback.date ?? rollback.startDate));
     return {
       rateID: rollback.rateID,
       roomTypeID: liveRow?.roomTypeID ?? "",
       roomTypeName: rollback.roomTypeName,
+      date: rollback.date ?? rollback.startDate,
       startDate: rollback.startDate,
       endDate: rollback.endDate,
       currentRate: liveRow?.currentRate ?? null,
@@ -424,6 +504,7 @@ async function createRollbackDraftFromBackup(id, operator = "local") {
     rollbackChanges: draft.changes.map((change) => ({
       rateID: change.rateID,
       roomTypeName: change.roomTypeName,
+      date: change.date,
       startDate: change.startDate,
       endDate: change.endDate,
       restoreRate: change.currentRate,
@@ -446,17 +527,20 @@ async function createRollbackDraftFromBackup(id, operator = "local") {
       changeCount: draft.changes.length,
       conflictCount: draft.changes.filter((change) => change.conflict).length,
       hash,
+      maxFetchDays: MAX_FETCH_DAYS,
+      maxDraftDays: MAX_DRAFT_DAYS,
+      maxDraftChanges: MAX_DRAFT_CHANGES,
     },
   });
   return draft;
 }
 
 async function pollJob(jobReferenceID) {
-  for (let attempt = 0; attempt < 12; attempt += 1) {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
     const json = await cloudbeds("getRateJobs", { jobReferenceID });
     const job = json.data?.[0];
-    if (job?.status && job.status !== "queued" && job.status !== "processing") return job;
-    await new Promise((resolve) => setTimeout(resolve, 750));
+    if (job?.status && !["queued", "processing", "in_progress"].includes(job.status)) return job;
+    await wait(1500);
   }
   const json = await cloudbeds("getRateJobs", { jobReferenceID });
   return json.data?.[0] ?? { jobReferenceID, status: "unknown", updates: [] };
@@ -466,7 +550,7 @@ async function applyDraft(id, confirmation) {
   const draft = await getDraft(id);
   if (!WRITES_ENABLED) throw new Error("Writes are disabled. Set ENABLE_CLOUDBEDS_WRITES=true to apply drafts.");
   if (draft.status === "applied") throw new Error("Draft has already been applied.");
-  if (confirmation !== `APPLY ${draft.id}`) throw new Error(`Confirmation must be: APPLY ${draft.id}`);
+  if (confirmation !== "yes") throw new Error("Apply confirmation is required.");
   if (draft.changes.length > MAX_APPLY_CHANGES) {
     throw new Error(`Draft has ${draft.changes.length} changes; current apply limit is ${MAX_APPLY_CHANGES}.`);
   }
@@ -522,13 +606,14 @@ async function applyDraft(id, confirmation) {
 
   const readback = await fetchRatePlans(draft.startDate, draft.endDate);
   const verification = draft.changes.map((change) => {
-    const row = readback.rows.find((candidate) => candidate.rateID === change.rateID);
+    const row = readback.rows.find((candidate) => candidate.rateID === change.rateID && candidate.date === change.date);
     return {
       rateID: change.rateID,
       roomTypeName: change.roomTypeName,
+      date: change.date,
       expectedRate: change.proposedRate,
       actualRate: row?.currentRate ?? null,
-      verified: row ? money(row.currentRate) === money(change.proposedRate) : false,
+      verified: row ? ratesEqual(row.currentRate, change.proposedRate) : false,
     };
   });
 
@@ -568,6 +653,7 @@ app.get("/api/config", (_req, res) => {
     writesEnabled: WRITES_ENABLED,
     limits: {
       maxDraftDays: MAX_DRAFT_DAYS,
+      maxFetchDays: MAX_FETCH_DAYS,
       maxDraftChanges: MAX_DRAFT_CHANGES,
       maxApplyChanges: MAX_APPLY_CHANGES,
     },
@@ -588,7 +674,7 @@ app.get("/api/rates", async (req, res) => {
       endDate,
       rows: fetched.rows.map(({ raw, ...row }) => ({
         ...row,
-        targetByDefault: targetRowsForDraft(fetched.rows).some((target) => target.rateID === row.rateID),
+        targetByDefault: targetRowsForDraft(fetched.rows).some((target) => target.rateID === row.rateID && target.date === row.date),
         proposedRate: smoothRate(row.currentRate),
       })),
     });

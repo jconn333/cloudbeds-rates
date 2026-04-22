@@ -16,8 +16,10 @@ Open `http://localhost:3787`.
 
 - Writes are disabled unless `ENABLE_CLOUDBEDS_WRITES=true`.
 - Creating a draft only reads Cloudbeds and writes local backup JSON.
-- Applying a draft requires typing `APPLY <draft-id>`.
+- Applying a draft requires confirming the browser "Are you sure?" prompt.
 - Drafts are hash-checked before execution.
+- Rate previews fetch each night separately so multi-night spans do not show Cloudbeds stay totals as nightly rates.
+- Fetches are capped by `MAX_FETCH_DAYS`.
 - Drafts are capped by `MAX_DRAFT_DAYS` and `MAX_DRAFT_CHANGES`.
 - Applies are capped by `MAX_APPLY_CHANGES`.
 - Every apply polls `getRateJobs` and re-reads Cloudbeds rates for verification.

@@ -23,6 +23,13 @@ function tomorrow(dateText) {
   return date.toISOString().slice(0, 10);
 }
 
+function inclusiveNightCount(startDate, endDate) {
+  if (!startDate || !endDate) return 0;
+  const start = new Date(`${startDate}T00:00:00Z`);
+  const end = new Date(`${endDate}T00:00:00Z`);
+  return Math.round((end - start) / 86400000) + 1;
+}
+
 async function api(path, options = {}) {
   const response = await fetch(path, {
     headers: { "content-type": "application/json", ...(options.headers ?? {}) },
@@ -35,7 +42,7 @@ async function api(path, options = {}) {
 
 function renderConfig() {
   const limits = state.config.limits;
-  $("propertyLine").textContent = `${state.config.propertyName} · property ${state.config.propertyId} · max ${limits.maxDraftDays} day / ${limits.maxDraftChanges} draft rows`;
+  $("propertyLine").textContent = `${state.config.propertyName} · property ${state.config.propertyId} · fetch ${limits.maxFetchDays} nights · draft ${limits.maxDraftDays} night / ${limits.maxDraftChanges} rows`;
   $("writeBadge").textContent = state.config.writesEnabled ? "Writes enabled" : "Preview mode";
   $("writeBadge").className = `badge ${state.config.writesEnabled ? "on" : "off"}`;
 }
@@ -51,13 +58,15 @@ function renderRates() {
   $("rateCount").textContent = `${state.rates.length} rows`;
   const body = $("ratesBody");
   if (!state.rates.length) {
-    body.innerHTML = `<tr><td colspan="5" class="empty">No rates loaded.</td></tr>`;
+    body.innerHTML = `<tr><td colspan="6" class="empty">No rates loaded.</td></tr>`;
     $("createDraft").disabled = true;
     return;
   }
 
   const targetCount = state.rates.filter((row) => row.targetByDefault && row.proposedRate !== row.currentRate).length;
-  $("createDraft").disabled = targetCount === 0;
+  const nights = inclusiveNightCount($("startDate").value, $("endDate").value || $("startDate").value);
+  const limits = state.config?.limits ?? { maxDraftDays: 1, maxDraftChanges: 20 };
+  $("createDraft").disabled = targetCount === 0 || targetCount > limits.maxDraftChanges || nights > limits.maxDraftDays;
   body.innerHTML = state.rates
     .map((row) => {
       const [label, tone] = rateStatus(row);
@@ -66,6 +75,7 @@ function renderRates() {
       return `
         <tr>
           <td><strong>${row.roomTypeName}</strong><br><span class="muted">rate ${row.rateID}</span></td>
+          <td>${row.date}</td>
           <td>${plan}</td>
           <td class="money">${formatMoney(row.currentRate)}</td>
           <td class="money">${draft}</td>
@@ -155,6 +165,7 @@ function renderDraftDetail(draft) {
       (change) => `
         <tr>
           <td><strong>${change.roomTypeName}</strong><br><span class="muted">rate ${change.rateID}</span></td>
+          <td>${change.date ?? change.startDate}</td>
           <td class="money">${formatMoney(change.currentRate)}</td>
           <td class="money">${formatMoney(change.proposedRate)}</td>
           <td><span class="pill ${change.conflict ? "warn" : "ok"}">${change.conflict ? "Review conflict" : `Rollback: ${formatMoney(change.currentRate)}`}</span></td>
@@ -167,11 +178,11 @@ function renderDraftDetail(draft) {
     draft.status === "draft"
       ? `
         <div class="approval">
-          <div class="field grow">
-            <label for="confirmText">Confirmation</label>
-            <input id="confirmText" type="text" placeholder="APPLY ${draft.id}">
-          </div>
           <button id="applyDraft" type="button"${state.config.writesEnabled ? "" : " disabled"}>Apply Approved Draft</button>
+          <span id="applyProgress" class="apply-progress" hidden>
+            <span class="spinner" aria-hidden="true"></span>
+            Applying and verifying with Cloudbeds...
+          </span>
         </div>
       `
       : "";
@@ -189,12 +200,13 @@ function renderDraftDetail(draft) {
         <thead>
           <tr>
             <th>Room</th>
+            <th>Date</th>
             <th>Original</th>
             <th>Proposed</th>
             <th>Rollback</th>
           </tr>
         </thead>
-        <tbody>${changesTable || `<tr><td colspan="4" class="empty">No changes in this draft.</td></tr>`}</tbody>
+        <tbody>${changesTable || `<tr><td colspan="5" class="empty">No changes in this draft.</td></tr>`}</tbody>
       </table>
     </div>
     ${applyControls}
@@ -223,7 +235,13 @@ async function fetchRates() {
   state.rates = json.rows;
   renderRates();
   const targetCount = state.rates.filter((row) => row.targetByDefault && row.proposedRate !== row.currentRate).length;
-  setMessage(`Loaded ${state.rates.length} rows. ${targetCount} base rates would change.`, "good");
+  const nights = inclusiveNightCount(startDate, endDate);
+  const limits = state.config.limits;
+  const limitNote =
+    targetCount > limits.maxDraftChanges || nights > limits.maxDraftDays
+      ? ` Draft creation is disabled by current limits (${limits.maxDraftDays} night / ${limits.maxDraftChanges} rows).`
+      : "";
+  setMessage(`Loaded ${state.rates.length} nightly rows across ${nights} night${nights === 1 ? "" : "s"}. ${targetCount} base rates would change.${limitNote}`, targetCount ? "good" : "");
 }
 
 async function createDraft() {
@@ -284,17 +302,38 @@ async function createRollbackDraft(backupId) {
 async function applySelectedDraft() {
   const draft = state.latestDraft;
   if (!draft) return;
-  setMessage("Applying approved draft and waiting for Cloudbeds verification...");
-  const json = await api(`/api/drafts/${draft.id}/apply`, {
-    method: "POST",
-    body: JSON.stringify({ confirmation: $("confirmText").value }),
-  });
-  renderDraftDetail(json.draft);
-  await loadDrafts();
-  await loadAudit();
-  await fetchRates();
-  const ok = json.draft.verification.every((item) => item.verified);
-  setMessage(ok ? "Draft applied and verified." : "Draft applied but verification found mismatches.", ok ? "good" : "error");
+  if (!window.confirm("Are you sure? This will write these approved rates to Cloudbeds.")) return;
+
+  const button = $("applyDraft");
+  const progress = $("applyProgress");
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Applying...";
+    button.classList.add("working");
+  }
+  if (progress) progress.hidden = false;
+
+  try {
+    setMessage("Applying approved draft and waiting for Cloudbeds verification...");
+    const json = await api(`/api/drafts/${draft.id}/apply`, {
+      method: "POST",
+      body: JSON.stringify({ confirmation: "yes" }),
+    });
+    renderDraftDetail(json.draft);
+    await loadDrafts();
+    await loadAudit();
+    await fetchRates();
+    const ok = json.draft.verification.every((item) => item.verified);
+    setMessage(ok ? "Draft applied and verified." : "Draft applied but verification found mismatches.", ok ? "good" : "error");
+  } catch (error) {
+    setMessage(error.message, "error");
+    if (button) {
+      button.disabled = false;
+      button.textContent = "Apply Approved Draft";
+      button.classList.remove("working");
+    }
+    if (progress) progress.hidden = true;
+  }
 }
 
 function setDefaultDates() {
