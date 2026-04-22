@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Cloudbeds Rate Smoother</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>Cloudbeds Rate Smoother</h1>
+        <p id="propertyLine">Loading property...</p>
+      </div>
+      <div id="writeBadge" class="badge">Checking write mode</div>
+    </header>
+
+    <main>
+      <section class="control-band">
+        <div class="field">
+          <label for="startDate">Start date</label>
+          <input id="startDate" type="date">
+        </div>
+        <div class="field">
+          <label for="endDate">End date</label>
+          <input id="endDate" type="date">
+        </div>
+        <div class="field grow">
+          <label for="notes">Batch note</label>
+          <input id="notes" type="text" placeholder="Optional note for audit trail">
+        </div>
+        <button id="fetchRates" type="button">Fetch Rates</button>
+        <button id="createDraft" type="button" disabled>Create Draft</button>
+      </section>
+
+      <section class="status-row">
+        <div id="message" class="message">Choose dates, then fetch rates.</div>
+      </section>
+
+      <section class="layout">
+        <div class="panel main-panel">
+          <div class="panel-head">
+            <h2>Live Rates</h2>
+            <span id="rateCount">0 rows</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Room</th>
+                  <th>Rate Plan</th>
+                  <th>Current</th>
+                  <th>Draft</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="ratesBody">
+                <tr>
+                  <td colspan="5" class="empty">No rates loaded.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <aside class="panel side-panel">
+          <div class="panel-head">
+            <h2>Drafts</h2>
+            <button id="refreshDrafts" type="button" class="secondary">Refresh</button>
+          </div>
+          <div id="draftList" class="draft-list"></div>
+          <div class="panel-head split-head">
+            <h2>Backups</h2>
+            <button id="refreshBackups" type="button" class="secondary">Refresh</button>
+          </div>
+          <div id="backupList" class="draft-list"></div>
+        </aside>
+      </section>
+
+      <section class="panel detail-panel">
+        <div class="panel-head">
+          <h2>Selected Draft</h2>
+          <span id="selectedDraftState">None selected</span>
+        </div>
+        <div id="draftDetail" class="draft-detail empty">Select or create a draft to review exact changes and backup metadata.</div>
+      </section>
+
+      <section class="panel detail-panel">
+        <div class="panel-head">
+          <h2>Audit Log</h2>
+          <button id="refreshAudit" type="button" class="secondary">Refresh</button>
+        </div>
+        <div id="auditList" class="audit-list empty">No audit events loaded.</div>
+      </section>
+    </main>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

@@ -1,0 +1,15 @@
+{
+  "name": "cloudbeds-rates",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node --no-warnings server.mjs",
+    "dev": "node --no-warnings --watch server.mjs",
+    "preflight": "bash scripts/preflight.sh"
+  },
+  "dependencies": {
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0"
+  }
+}
