@@ -31,6 +31,7 @@
         </div>
         <button id="fetchRates" type="button">Fetch Rates</button>
         <button id="createDraft" type="button" disabled>Create Draft</button>
+        <button id="createRun" type="button" class="secondary" disabled>Create Run</button>
       </section>
 
       <section class="status-row">
@@ -40,32 +41,36 @@
       <section class="layout">
         <div class="panel main-panel">
           <div class="panel-head">
-            <h2>Live Rates</h2>
+            <h2>Rate Calendar</h2>
             <span id="rateCount">0 rows</span>
           </div>
-          <div class="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Room</th>
-                  <th>Date</th>
-                  <th>Rate Plan</th>
-                  <th>Current</th>
-                  <th>Draft</th>
-                  <th>Status</th>
-                </tr>
-              </thead>
-              <tbody id="ratesBody">
-                <tr>
-                  <td colspan="5" class="empty">No rates loaded.</td>
-                </tr>
-              </tbody>
-            </table>
+          <div id="rateSummary" class="summary-grid compact-summary"></div>
+          <div class="view-toolbar">
+            <label class="check-field">
+              <input id="changesOnly" type="checkbox" checked>
+              <span>Changes only</span>
+            </label>
+            <label class="check-field">
+              <input id="showIgnored" type="checkbox">
+              <span>Show ignored rows</span>
+            </label>
           </div>
+          <div id="rateGridWrap" class="calendar-wrap">
+            <div class="empty">No rates loaded.</div>
+          </div>
+          <details id="exceptionsPanel" class="exceptions-panel">
+            <summary>Ignored Cloudbeds rows</summary>
+            <div id="exceptionsList" class="exceptions-list empty">No ignored rows loaded.</div>
+          </details>
         </div>
 
         <aside class="panel side-panel">
           <div class="panel-head">
+            <h2>Batch Runs</h2>
+            <button id="refreshRuns" type="button" class="secondary">Refresh</button>
+          </div>
+          <div id="runList" class="draft-list"></div>
+          <div class="panel-head split-head">
             <h2>Drafts</h2>
             <button id="refreshDrafts" type="button" class="secondary">Refresh</button>
           </div>
@@ -76,6 +81,14 @@
           </div>
           <div id="backupList" class="draft-list"></div>
         </aside>
+      </section>
+
+      <section class="panel detail-panel">
+        <div class="panel-head">
+          <h2>Selected Run</h2>
+          <span id="selectedRunState">None selected</span>
+        </div>
+        <div id="runDetail" class="draft-detail empty">Create or select a large batch run to inspect chunk planning, apply progress, and rollback readiness.</div>
       </section>
 
       <section class="panel detail-panel">

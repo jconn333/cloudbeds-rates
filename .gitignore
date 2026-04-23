@@ -4,3 +4,4 @@ data/
 logs/
 .DS_Store
 npm-debug.log*
+output/
