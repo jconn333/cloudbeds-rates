@@ -28,7 +28,8 @@ body {
 }
 
 button,
-input {
+input,
+select {
   font: inherit;
 }
 
@@ -82,7 +83,8 @@ main {
 }
 
 .control-band {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(210px, 1.15fr) minmax(140px, 0.7fr) minmax(140px, 0.7fr) minmax(220px, 1.3fr) auto;
   align-items: end;
   gap: 14px;
   padding: 16px;
@@ -95,8 +97,18 @@ main {
 }
 
 .field.grow {
-  flex: 1;
   min-width: 220px;
+}
+
+.action-field {
+  display: flex;
+  align-items: end;
+  gap: 10px;
+}
+
+.action-field button {
+  min-width: 128px;
+  white-space: nowrap;
 }
 
 label {
@@ -106,7 +118,8 @@ label {
   text-transform: uppercase;
 }
 
-input {
+input,
+select {
   width: 100%;
   height: 42px;
   border: 1px solid var(--line);
@@ -114,6 +127,10 @@ input {
   background: var(--field);
   color: var(--ink);
   padding: 0 12px;
+}
+
+.property-field {
+  min-width: 210px;
 }
 
 input[type="checkbox"] {
@@ -180,6 +197,47 @@ button.secondary {
 
 .message.good {
   color: var(--ok);
+}
+
+.operation-progress {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.operation-progress[hidden] {
+  display: none;
+}
+
+.operation-progress-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--ink);
+  font-size: 13px;
+}
+
+.operation-progress-head span,
+.operation-progress-detail {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.progress-track {
+  height: 10px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--field);
+}
+
+.progress-fill {
+  width: 0%;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 0.24s ease;
 }
 
 .layout {
@@ -794,10 +852,22 @@ button.working {
 }
 
 @media (max-width: 980px) {
-  .topbar,
-  .control-band {
+  .topbar {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .control-band {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .field.grow,
+  .action-field {
+    grid-column: 1 / -1;
+  }
+
+  .action-field {
+    align-items: stretch;
   }
 
   .layout {
@@ -814,6 +884,10 @@ button.working {
 }
 
 @media (max-width: 560px) {
+  .control-band {
+    grid-template-columns: 1fr;
+  }
+
   .summary-grid {
     grid-template-columns: 1fr;
   }

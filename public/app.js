@@ -1,5 +1,6 @@
 const state = {
   config: null,
+  selectedPropertyKey: null,
   rates: [],
   latestRun: null,
   latestRunEvents: [],
@@ -39,6 +40,60 @@ function inclusiveNightCount(startDate, endDate) {
   const start = new Date(`${startDate}T00:00:00Z`);
   const end = new Date(`${endDate}T00:00:00Z`);
   return Math.round((end - start) / 86400000) + 1;
+}
+
+function enumerateNights(startDate, endDate) {
+  const nights = [];
+  if (!startDate || !endDate) return nights;
+  const cursor = new Date(`${startDate}T00:00:00Z`);
+  const end = new Date(`${endDate}T00:00:00Z`);
+  while (cursor <= end) {
+    nights.push(cursor.toISOString().slice(0, 10));
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+  }
+  return nights;
+}
+
+function clampPercent(value) {
+  return Math.max(0, Math.min(100, Math.round(Number(value) || 0)));
+}
+
+function setOperationProgress({ label = "Working...", detail = "", completed = 0, total = 1, percent = null } = {}) {
+  const wrap = $("operationProgress");
+  const fill = $("operationProgressFill");
+  const track = wrap?.querySelector(".progress-track");
+  if (!wrap || !fill) return;
+  const computedPercent = percent === null ? (total > 0 ? (completed / total) * 100 : 0) : percent;
+  const safePercent = clampPercent(computedPercent);
+  wrap.hidden = false;
+  $("operationProgressLabel").textContent = label;
+  $("operationProgressPercent").textContent = `${safePercent}%`;
+  $("operationProgressDetail").textContent = detail;
+  fill.style.width = `${safePercent}%`;
+  if (track) track.setAttribute("aria-valuenow", String(safePercent));
+}
+
+function hideOperationProgress() {
+  const wrap = $("operationProgress");
+  if (wrap) wrap.hidden = true;
+}
+
+function runProgressPercent(run) {
+  const chunks = run?.chunks ?? [];
+  if (!chunks.length) return 0;
+  const completeWeight = chunks.reduce((sum, chunk) => sum + (["applied", "skipped"].includes(chunk.status) ? 1 : 0), 0);
+  const activeSequence = run.progress?.activeChunkSequence;
+  const activeBonus = activeSequence && run.status === "running" ? 0.35 : 0;
+  return clampPercent(((completeWeight + activeBonus) / chunks.length) * 100);
+}
+
+function describeRunProgress(run) {
+  const chunks = run?.chunks ?? [];
+  const completed = chunks.filter((chunk) => ["applied", "skipped"].includes(chunk.status)).length;
+  const total = chunks.length || 1;
+  const active = run?.progress?.activeChunkSequence;
+  const base = active ? `Chunk ${active} of ${total}` : `${completed} of ${total} chunks complete`;
+  return `${base} · ${run?.progress?.message ?? run?.status ?? "Working"}`;
 }
 
 function formatDateLabel(dateText) {
@@ -105,13 +160,14 @@ function summarizeRunEvent(event) {
 function runPrimaryAction(run, failedChunks, appliedChunks) {
   const resumable = ["planned", "running", "paused", "verification_failed", "apply_failed"].includes(run.status);
   if (!resumable) return null;
+  const hasProgress = appliedChunks > 0 || failedChunks > 0 || run.status === "paused";
   if (run.type === "rollback") {
-    return { label: appliedChunks ? "Resume Rollback Run" : "Execute Rollback Run", mode: "resume" };
+    return { label: hasProgress ? "Resume Rollback Run" : "Execute Rollback Run", mode: "resume" };
   }
   if (failedChunks) {
-    return { label: appliedChunks ? "Resume Run" : "Start Run", mode: "resume" };
+    return { label: "Resume Run", mode: "resume" };
   }
-  return { label: appliedChunks ? "Resume Run" : "Apply Run in Chunks", mode: "resume" };
+  return { label: hasProgress ? "Resume Run" : "Apply Run in Chunks", mode: "resume" };
 }
 
 function moneyDelta(currentRate, proposedRate) {
@@ -130,9 +186,36 @@ async function api(path, options = {}) {
 
 function renderConfig() {
   const limits = state.config.limits;
-  $("propertyLine").textContent = `${state.config.propertyName} · property ${state.config.propertyId} · fetch ${limits.maxFetchDays} nights · draft ${limits.maxDraftDays} night / ${limits.maxDraftChanges} rows · run ${limits.maxRunDays} nights in ${limits.runChunkMaxNights}-night / ${limits.runChunkMaxChanges}-row chunks`;
+  const properties = state.config.properties ?? [
+    { key: state.config.defaultPropertyKey, propertyId: state.config.propertyId, propertyName: state.config.propertyName },
+  ];
+  const select = $("propertySelect");
+  select.innerHTML = properties
+    .map(
+      (property) =>
+        `<option value="${escapeHtml(property.key)}"${property.key === state.selectedPropertyKey ? " selected" : ""}>${escapeHtml(property.propertyName)}</option>`
+    )
+    .join("");
+  const selected = currentProperty();
+  $("propertyLine").textContent = `${selected.propertyName} · property ${selected.propertyId} · fetch ${limits.maxFetchDays} nights · draft ${limits.maxDraftDays} night / ${limits.maxDraftChanges} rows · run ${limits.maxRunDays} nights in ${limits.runChunkMaxNights}-night / ${limits.runChunkMaxChanges}-row chunks`;
   $("writeBadge").textContent = state.config.writesEnabled ? "Writes enabled" : "Preview mode";
   $("writeBadge").className = `badge ${state.config.writesEnabled ? "on" : "off"}`;
+}
+
+function currentProperty() {
+  const properties = state.config?.properties ?? [];
+  return (
+    properties.find((property) => property.key === state.selectedPropertyKey) ??
+    properties.find((property) => property.key === state.config?.defaultPropertyKey) ?? {
+      key: state.config?.defaultPropertyKey,
+      propertyId: state.config?.propertyId,
+      propertyName: state.config?.propertyName,
+    }
+  );
+}
+
+function selectedPropertyKey() {
+  return currentProperty().key;
 }
 
 function rateStatus(row) {
@@ -326,7 +409,7 @@ function renderRates() {
     $("rateSummary").innerHTML = "";
     wrap.innerHTML = `<div class="empty">No rates loaded.</div>`;
     $("exceptionsList").textContent = "No ignored rows loaded.";
-    $("createDraft").disabled = true;
+    $("createRun").disabled = true;
     return;
   }
 
@@ -334,7 +417,6 @@ function renderRates() {
   const targetCount = summary.changedRows.length;
   const nights = inclusiveNightCount($("startDate").value, $("endDate").value || $("startDate").value);
   const limits = state.config?.limits ?? { maxDraftDays: 1, maxDraftChanges: 20, maxRunDays: 45 };
-  $("createDraft").disabled = targetCount === 0 || targetCount > limits.maxDraftChanges || nights > limits.maxDraftDays;
   $("createRun").disabled = targetCount === 0 || nights > limits.maxRunDays;
   renderRateSummary(summary, targetCount, nights, limits);
   renderRateGrid(summary);
@@ -352,7 +434,7 @@ function renderDraftList(drafts) {
     .map(
       (draft) => `
         <button class="draft-item" data-draft-id="${draft.id}" type="button">
-          <strong>${draft.startDate} to ${draft.endDate}</strong>
+          <strong>${escapeHtml(draft.propertyName ?? "")} · ${draft.startDate} to ${draft.endDate}</strong>
           <span>${draft.changeCount} changes · ${draft.status}</span>
           <span>${draft.id}</span>
         </button>
@@ -376,7 +458,7 @@ function renderBackupList(backups) {
     .map(
       (backup) => `
         <button class="draft-item backup-item" data-backup-id="${backup.id}" type="button">
-          <strong>${backup.startDate} to ${backup.endDate}</strong>
+          <strong>${escapeHtml(backup.propertyName ?? "")} · ${backup.startDate} to ${backup.endDate}</strong>
           <span>${backup.rollbackCount} rollback rows</span>
           <span>${backup.id}</span>
         </button>
@@ -400,7 +482,7 @@ function renderRunList(runs) {
     .map(
       (run) => `
         <button class="draft-item run-item" data-run-id="${run.id}" type="button">
-          <strong>${run.startDate} to ${run.endDate}</strong>
+          <strong>${escapeHtml(run.propertyName ?? "")} · ${run.startDate} to ${run.endDate}</strong>
           <span>${run.totalChanges} changes · ${run.chunkCount} chunks · ${run.status}</span>
           <span>${run.id}</span>
         </button>
@@ -535,6 +617,7 @@ function renderRunDetail(run) {
   $("runDetail").className = "draft-detail";
   $("runDetail").innerHTML = `
     <div class="summary-grid">
+      <div class="metric"><span>Property</span><strong>${escapeHtml(run.propertyName)}</strong></div>
       <div class="metric"><span>Type</span><strong>${escapeHtml(run.type)}</strong></div>
       <div class="metric"><span>Total changes</span><strong>${run.totalChanges}</strong></div>
       <div class="metric"><span>Chunks</span><strong>${appliedChunks}/${run.chunkCount}</strong></div>
@@ -821,6 +904,7 @@ function renderDraftDetail(draft) {
 
 async function loadConfig() {
   state.config = await api("/api/config");
+  state.selectedPropertyKey = state.selectedPropertyKey ?? state.config.defaultPropertyKey;
   renderConfig();
 }
 
@@ -831,36 +915,74 @@ async function fetchRates() {
     setMessage("Choose a start date first.", "error");
     return;
   }
-  setMessage("Fetching live Cloudbeds rates...");
-  const json = await api(`/api/rates?startDate=${encodeURIComponent(startDate)}&endDate=${encodeURIComponent(endDate)}`);
-  state.rates = json.rows;
-  renderRates();
-  const targetCount = state.rates.filter((row) => row.targetByDefault && row.proposedRate !== row.currentRate).length;
-  const nights = inclusiveNightCount(startDate, endDate);
-  const limits = state.config.limits;
-  const draftLimitNote =
-    targetCount > limits.maxDraftChanges || nights > limits.maxDraftDays
-      ? ` Draft creation is disabled by current limits (${limits.maxDraftDays} night / ${limits.maxDraftChanges} rows).`
-      : "";
-  const runLimitNote = nights > limits.maxRunDays ? ` Large-batch runs are capped at ${limits.maxRunDays} nights.` : "";
-  setMessage(
-    `Loaded ${state.rates.length} nightly rows across ${nights} night${nights === 1 ? "" : "s"}. ${targetCount} base rates would change.${draftLimitNote}${runLimitNote}`,
-    targetCount ? "good" : ""
-  );
-}
+  const nights = enumerateNights(startDate, endDate);
+  if (!nights.length) {
+    setMessage("End night must be on or after start night.", "error");
+    return;
+  }
+  const rows = [];
+  const fetchButton = $("fetchRates");
+  const runButton = $("createRun");
+  if (fetchButton) {
+    fetchButton.disabled = true;
+    fetchButton.textContent = "Fetching...";
+  }
+  if (runButton) runButton.disabled = true;
 
-async function createDraft() {
-  const startDate = $("startDate").value;
-  const endDate = $("endDate").value || tomorrow(startDate);
-  setMessage("Creating draft and backup snapshot...");
-  const json = await api("/api/drafts", {
-    method: "POST",
-    body: JSON.stringify({ startDate, endDate, operator: "web-app", notes: $("notes").value }),
-  });
-  renderDraftDetail(json.draft);
-  await loadDrafts();
-  await loadAudit();
-  setMessage(`Draft ${json.draft.id} created with ${json.draft.changes.length} changes.`, "good");
+  try {
+    setMessage("Fetching live Cloudbeds rates...");
+    setOperationProgress({
+      label: "Fetching rates",
+      detail: `Starting ${nights.length} night${nights.length === 1 ? "" : "s"} from Cloudbeds...`,
+      completed: 0,
+      total: nights.length,
+    });
+    for (const [index, night] of nights.entries()) {
+      setOperationProgress({
+        label: "Fetching rates",
+        detail: `Fetching ${formatDateLabel(night)} (${index + 1} of ${nights.length})`,
+        completed: index,
+        total: nights.length,
+      });
+      const params = new URLSearchParams({
+        propertyKey: selectedPropertyKey(),
+        startDate: night,
+        endDate: night,
+      });
+      const json = await api(`/api/rates?${params}`);
+      rows.push(...json.rows);
+      setOperationProgress({
+        label: "Fetching rates",
+        detail: `Loaded ${formatDateLabel(night)} (${index + 1} of ${nights.length})`,
+        completed: index + 1,
+        total: nights.length,
+      });
+    }
+    state.rates = rows;
+    renderRates();
+    const targetCount = state.rates.filter((row) => row.targetByDefault && row.proposedRate !== row.currentRate).length;
+    const limits = state.config.limits;
+    const draftLimitNote =
+      targetCount > limits.maxDraftChanges || nights.length > limits.maxDraftDays
+        ? ` Draft creation is disabled by current limits (${limits.maxDraftDays} night / ${limits.maxDraftChanges} rows).`
+        : "";
+    const runLimitNote = nights.length > limits.maxRunDays ? ` Large-batch runs are capped at ${limits.maxRunDays} nights.` : "";
+    setMessage(
+      `Loaded ${state.rates.length} nightly rows across ${nights.length} night${nights.length === 1 ? "" : "s"}. ${targetCount} base rates would change.${draftLimitNote}${runLimitNote}`,
+      targetCount ? "good" : ""
+    );
+    setOperationProgress({
+      label: "Fetch complete",
+      detail: `${state.rates.length} rows loaded.`,
+      percent: 100,
+    });
+  } finally {
+    if (fetchButton) {
+      fetchButton.disabled = false;
+      fetchButton.textContent = "Fetch Rates";
+    }
+    renderRates();
+  }
 }
 
 async function createRun() {
@@ -869,7 +991,7 @@ async function createRun() {
   setMessage("Planning large-batch run and chunk boundaries...");
   const json = await api("/api/runs", {
     method: "POST",
-    body: JSON.stringify({ startDate, endDate, operator: "web-app", notes: $("notes").value, type: "smooth" }),
+    body: JSON.stringify({ propertyKey: selectedPropertyKey(), startDate, endDate, operator: "web-app", notes: $("notes").value, type: "smooth" }),
   });
   const events = await api(`/api/runs/${json.run.id}/events?limit=20`);
   state.latestRunEvents = events.events;
@@ -933,6 +1055,35 @@ async function createRollbackDraft(backupId) {
   );
 }
 
+function startRunProgressPolling(runId) {
+  let stopped = false;
+  let inFlight = false;
+  const poll = async () => {
+    if (stopped || inFlight) return;
+    inFlight = true;
+    try {
+      const json = await api(`/api/runs/${runId}`);
+      state.latestRun = json.run;
+      renderRunDetail(json.run);
+      setOperationProgress({
+        label: json.run.type === "rollback" ? "Executing rollback run" : "Executing run chunks",
+        detail: describeRunProgress(json.run),
+        percent: runProgressPercent(json.run),
+      });
+    } catch {
+      // Keep the in-flight operation moving even if one status poll misses.
+    } finally {
+      inFlight = false;
+    }
+  };
+  poll();
+  const timer = window.setInterval(poll, 1500);
+  return () => {
+    stopped = true;
+    window.clearInterval(timer);
+  };
+}
+
 async function applySelectedRun() {
   const run = state.latestRun;
   if (!run) return;
@@ -952,6 +1103,12 @@ async function applySelectedRun() {
   if (retryButton) retryButton.disabled = true;
   if (rollbackButton) rollbackButton.disabled = true;
   if (progress) progress.hidden = false;
+  setOperationProgress({
+    label: run.type === "rollback" ? "Executing rollback run" : "Executing run chunks",
+    detail: describeRunProgress(run),
+    percent: runProgressPercent(run),
+  });
+  const stopPolling = startRunProgressPolling(run.id);
 
   try {
     setMessage("Executing chunked run with live drift checks...");
@@ -962,6 +1119,11 @@ async function applySelectedRun() {
     const events = await api(`/api/runs/${run.id}/events?limit=20`);
     state.latestRunEvents = events.events;
     renderRunDetail(json.run);
+    setOperationProgress({
+      label: json.run.status === "applied" ? "Run complete" : "Run paused",
+      detail: describeRunProgress(json.run),
+      percent: runProgressPercent(json.run),
+    });
     await loadRuns();
     await loadDrafts();
     await loadBackups();
@@ -979,6 +1141,13 @@ async function applySelectedRun() {
     if (retryButton) retryButton.disabled = false;
     if (rollbackButton) rollbackButton.disabled = false;
     if (progress) progress.hidden = true;
+    setOperationProgress({
+      label: "Run stopped",
+      detail: error.message,
+      percent: runProgressPercent(state.latestRun ?? run),
+    });
+  } finally {
+    stopPolling();
   }
 }
 
@@ -998,6 +1167,12 @@ async function retryFailedChunk() {
   }
   if (rollbackButton) rollbackButton.disabled = true;
   if (progress) progress.hidden = false;
+  setOperationProgress({
+    label: "Retrying failed chunk",
+    detail: describeRunProgress(run),
+    percent: runProgressPercent(run),
+  });
+  const stopPolling = startRunProgressPolling(run.id);
 
   try {
     setMessage("Retrying the first failed chunk with a fresh preflight...");
@@ -1008,6 +1183,11 @@ async function retryFailedChunk() {
     const events = await api(`/api/runs/${run.id}/events?limit=20`);
     state.latestRunEvents = events.events;
     renderRunDetail(json.run);
+    setOperationProgress({
+      label: json.run.status === "applied" ? "Run complete" : "Retry finished",
+      detail: describeRunProgress(json.run),
+      percent: runProgressPercent(json.run),
+    });
     await loadRuns();
     await loadDrafts();
     await loadBackups();
@@ -1016,7 +1196,14 @@ async function retryFailedChunk() {
     setMessage(json.run.status === "applied" ? "Failed chunk retry completed and the run is now applied." : `Retry finished with status ${json.run.status}. Review the run detail.`, json.run.status === "applied" ? "good" : "error");
   } catch (error) {
     setMessage(error.message, "error");
+    setOperationProgress({
+      label: "Retry stopped",
+      detail: error.message,
+      percent: runProgressPercent(state.latestRun ?? run),
+    });
     await loadRun(run.id).catch(() => {});
+  } finally {
+    stopPolling();
   }
 }
 
@@ -1110,7 +1297,13 @@ function setDefaultDates() {
 async function init() {
   setDefaultDates();
   $("fetchRates").addEventListener("click", () => fetchRates().catch((error) => setMessage(error.message, "error")));
-  $("createDraft").addEventListener("click", () => createDraft().catch((error) => setMessage(error.message, "error")));
+  $("propertySelect").addEventListener("change", () => {
+    state.selectedPropertyKey = $("propertySelect").value;
+    state.rates = [];
+    renderConfig();
+    renderRates();
+    setMessage(`Selected ${currentProperty().propertyName}. Fetch rates when ready.`);
+  });
   $("createRun").addEventListener("click", () => createRun().catch((error) => setMessage(error.message, "error")));
   $("changesOnly").addEventListener("change", renderRates);
   $("showIgnored").addEventListener("change", renderRates);

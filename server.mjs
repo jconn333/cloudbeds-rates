@@ -16,9 +16,7 @@ const PUBLIC_DIR = path.join(__dirname, "public");
 const PORT = Number(process.env.PORT ?? "3787");
 const CLOUDBEDS_BASE_URL = "https://api.cloudbeds.com/api/v1.3";
 
-const TARGET_PROPERTY_ID = process.env.CLOUDBEDS_PROPERTY_ID ?? "";
-const TARGET_PROPERTY_NAME = process.env.CLOUDBEDS_PROPERTY_NAME ?? "Berlin Encore";
-const API_KEY = process.env.CLOUDBEDS_API_KEY ?? "";
+const DEFAULT_PROPERTY_KEY = process.env.CLOUDBEDS_DEFAULT_PROPERTY ?? "berlin-encore";
 const WRITES_ENABLED = String(process.env.ENABLE_CLOUDBEDS_WRITES ?? "").toLowerCase() === "true";
 const MAX_FETCH_DAYS = Number(process.env.MAX_FETCH_DAYS ?? "400");
 const MAX_DRAFT_DAYS = Number(process.env.MAX_DRAFT_DAYS ?? "7");
@@ -27,6 +25,9 @@ const MAX_APPLY_CHANGES = Number(process.env.MAX_APPLY_CHANGES ?? "100");
 const MAX_RUN_DAYS = Number(process.env.MAX_RUN_DAYS ?? "400");
 const RUN_CHUNK_MAX_CHANGES = Number(process.env.RUN_CHUNK_MAX_CHANGES ?? "80");
 const RUN_CHUNK_MAX_NIGHTS = Number(process.env.RUN_CHUNK_MAX_NIGHTS ?? "7");
+const MIN_ALLOWED_RATE = Number(process.env.MIN_ALLOWED_RATE ?? "1");
+const MAX_ALLOWED_RATE = Number(process.env.MAX_ALLOWED_RATE ?? "999.99");
+const MAX_SMOOTH_RATE_DECREASE = Number(process.env.MAX_SMOOTH_RATE_DECREASE ?? "0.99");
 const VERIFY_RETRY_ATTEMPTS = Number(process.env.VERIFY_RETRY_ATTEMPTS ?? "4");
 const VERIFY_RETRY_DELAY_MS = Number(process.env.VERIFY_RETRY_DELAY_MS ?? "3000");
 const SAFETY_METADATA = {
@@ -34,15 +35,90 @@ const SAFETY_METADATA = {
   verificationMode: "targeted_scope_adjacent",
   backupSnapshotMode: "full_base_scope",
   correctiveDraftMode: "spill_repair_v1",
+  rateGuardMode: "absolute_bounds_and_smooth_delta",
 };
 
 let auditDb;
 
-function requireConfig() {
-  if (!API_KEY) throw new Error("CLOUDBEDS_API_KEY is missing.");
-  if (!TARGET_PROPERTY_ID) throw new Error("CLOUDBEDS_PROPERTY_ID is missing.");
-  if (API_KEY.startsWith("CLOUDBEDS_API_KEY=")) {
-    throw new Error("CLOUDBEDS_API_KEY must be the raw key, not a prefixed assignment.");
+function normalizeEnv(value) {
+  return String(value ?? "").trim().replace(/^"|"$/g, "");
+}
+
+function slugify(value) {
+  return String(value ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/&/g, "and")
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
+}
+
+function buildPropertyConfig({ key, propertyId, propertyName, apiKey, source }) {
+  return {
+    key,
+    propertyId: normalizeEnv(propertyId),
+    propertyName: normalizeEnv(propertyName),
+    apiKey: normalizeEnv(apiKey),
+    source,
+  };
+}
+
+const PROPERTY_CONFIGS = [
+  buildPropertyConfig({
+    key: "berlin-encore",
+    propertyId: process.env.CLOUDBEDS_BERLIN_ENCORE_PROPERTY_ID ?? process.env.CLOUDBEDS_PROPERTY_ID,
+    propertyName:
+      process.env.CLOUDBEDS_BERLIN_ENCORE_PROPERTY_NAME ??
+      process.env.CLOUDBEDS_PROPERTY_NAME ??
+      "Berlin Encore Hotel & Suites",
+    apiKey: process.env.CLOUDBEDS_BERLIN_ENCORE_API_KEY ?? process.env.CLOUDBEDS_API_KEY,
+    source: "berlin-encore",
+  }),
+  buildPropertyConfig({
+    key: "berlin-resort",
+    propertyId: process.env.CLOUDBEDS_BERLIN_RESORT_PROPERTY_ID ?? "304361",
+    propertyName: process.env.CLOUDBEDS_BERLIN_RESORT_PROPERTY_NAME ?? "Berlin Resort",
+    apiKey: process.env.CLOUDBEDS_BERLIN_RESORT_API_KEY,
+    source: "berlin-resort",
+  }),
+].filter((property) => property.apiKey || property.propertyId);
+
+function publicProperty(property) {
+  return {
+    key: property.key,
+    propertyId: property.propertyId,
+    propertyName: property.propertyName,
+    isDefault: property.key === resolveDefaultProperty().key,
+  };
+}
+
+function resolveDefaultProperty() {
+  return (
+    PROPERTY_CONFIGS.find((property) => property.key === DEFAULT_PROPERTY_KEY) ??
+    PROPERTY_CONFIGS.find((property) => property.apiKey && property.propertyId) ??
+    PROPERTY_CONFIGS[0]
+  );
+}
+
+function resolveProperty(propertyKeyOrId = DEFAULT_PROPERTY_KEY) {
+  const lookup = normalizeEnv(propertyKeyOrId) || DEFAULT_PROPERTY_KEY;
+  const property =
+    PROPERTY_CONFIGS.find((item) => item.key === lookup) ??
+    PROPERTY_CONFIGS.find((item) => item.propertyId === lookup) ??
+    PROPERTY_CONFIGS.find((item) => slugify(item.propertyName) === slugify(lookup));
+  if (!property) {
+    throw new Error(`Unknown Cloudbeds property "${lookup}".`);
+  }
+  requireConfig(property);
+  return property;
+}
+
+function requireConfig(property = resolveDefaultProperty()) {
+  if (!property) throw new Error("No Cloudbeds property is configured.");
+  if (!property.apiKey) throw new Error(`CLOUDBEDS API key is missing for ${property.propertyName || property.key}.`);
+  if (!property.propertyId) throw new Error(`CLOUDBEDS property ID is missing for ${property.propertyName || property.key}.`);
+  if (property.apiKey.startsWith("CLOUDBEDS_API_KEY=")) {
+    throw new Error("Cloudbeds API keys must be raw keys, not prefixed assignments.");
   }
 }
 
@@ -57,6 +133,7 @@ function stableJson(value) {
 function buildDraftPayload({
   id,
   backupId,
+  propertyKey = null,
   propertyId,
   propertyName,
   startDate,
@@ -74,6 +151,7 @@ function buildDraftPayload({
   return {
     id,
     backupId,
+    ...(propertyKey ? { propertyKey } : {}),
     propertyId,
     propertyName,
     startDate,
@@ -183,6 +261,46 @@ function ratesEqual(left, right) {
   return Math.abs(money(left) - money(right)) < 0.005;
 }
 
+function changeIdentity(change) {
+  return `${change.date ?? change.startDate ?? "unknown date"} ${change.roomTypeName ?? "unknown room"} ${change.rateID ?? ""}`.trim();
+}
+
+function isSmoothRule(rule) {
+  return String(rule ?? "").toLowerCase().includes("truncate cents");
+}
+
+function assertSafeRateChanges(changes, { rule = "" } = {}) {
+  for (const change of changes) {
+    const proposedRate = Number(change.proposedRate);
+    if (!Number.isFinite(proposedRate)) {
+      throw new Error(`Unsafe rate change for ${changeIdentity(change)}: proposed rate is not a finite number.`);
+    }
+    if (proposedRate < MIN_ALLOWED_RATE || proposedRate > MAX_ALLOWED_RATE) {
+      throw new Error(
+        `Unsafe rate change for ${changeIdentity(change)}: proposed $${money(proposedRate).toFixed(2)} is outside allowed range $${MIN_ALLOWED_RATE.toFixed(2)}-$${MAX_ALLOWED_RATE.toFixed(2)}.`
+      );
+    }
+
+    if (!isSmoothRule(rule)) continue;
+
+    const currentRate = Number(change.currentRate);
+    if (!Number.isFinite(currentRate)) {
+      throw new Error(`Unsafe smooth change for ${changeIdentity(change)}: current rate is not a finite number.`);
+    }
+    const decrease = money(currentRate) - money(proposedRate);
+    if (decrease < -0.005) {
+      throw new Error(
+        `Unsafe smooth change for ${changeIdentity(change)}: smooth drafts may not increase rates from $${money(currentRate).toFixed(2)} to $${money(proposedRate).toFixed(2)}.`
+      );
+    }
+    if (decrease > MAX_SMOOTH_RATE_DECREASE + 0.005) {
+      throw new Error(
+        `Unsafe smooth change for ${changeIdentity(change)}: decrease $${decrease.toFixed(2)} exceeds $${MAX_SMOOTH_RATE_DECREASE.toFixed(2)}.`
+      );
+    }
+  }
+}
+
 function wait(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -214,7 +332,16 @@ function initAuditDb() {
   `);
 }
 
-function auditEvent({ type, operator = "system", entityType = null, entityId = null, startDate = null, endDate = null, payload = {} }) {
+function auditEvent({
+  type,
+  operator = "system",
+  entityType = null,
+  entityId = null,
+  propertyId = resolveDefaultProperty()?.propertyId ?? null,
+  startDate = null,
+  endDate = null,
+  payload = {},
+}) {
   if (!auditDb) return;
   auditDb
     .prepare(`
@@ -239,7 +366,7 @@ function auditEvent({ type, operator = "system", entityType = null, entityId = n
       operator,
       entityType,
       entityId,
-      TARGET_PROPERTY_ID,
+      propertyId,
       startDate,
       endDate,
       JSON.stringify(payload)
@@ -304,10 +431,10 @@ async function readJson(filePath) {
   return JSON.parse(await fs.readFile(filePath, "utf8"));
 }
 
-async function cloudbeds(method, params = {}, init = {}) {
-  requireConfig();
+async function cloudbeds(method, params = {}, init = {}, propertyContext = resolveDefaultProperty()) {
+  const property = resolveProperty(propertyContext.key ?? propertyContext.propertyId ?? propertyContext);
   const requestMethod = (init.method ?? "GET").toUpperCase();
-  const headers = { "x-api-key": API_KEY, ...(init.headers ?? {}) };
+  const headers = { "x-api-key": property.apiKey, ...(init.headers ?? {}) };
 
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const url = new URL(`${CLOUDBEDS_BASE_URL}/${method}`);
@@ -345,8 +472,8 @@ async function cloudbeds(method, params = {}, init = {}) {
   throw new Error("Cloudbeds request failed after retries.");
 }
 
-async function fetchRatePlansForNight(date, checkoutDate) {
-  const json = await cloudbeds("getRatePlans", { startDate: date, endDate: checkoutDate });
+async function fetchRatePlansForNight(date, checkoutDate, propertyContext = resolveDefaultProperty()) {
+  const json = await cloudbeds("getRatePlans", { startDate: date, endDate: checkoutDate }, {}, propertyContext);
   const rows = (json.data ?? []).map((row) => ({
     date,
     startDate: date,
@@ -366,11 +493,11 @@ async function fetchRatePlansForNight(date, checkoutDate) {
   return { raw: json, rows };
 }
 
-async function fetchRatePlans(startDate, endDate) {
+async function fetchRatePlans(startDate, endDate, propertyContext = resolveDefaultProperty()) {
   const nights = enumerateNights(startDate, endDate);
   const nightlyResults = [];
   for (const night of nights) {
-    nightlyResults.push(await fetchRatePlansForNight(night.date, night.checkoutDate));
+    nightlyResults.push(await fetchRatePlansForNight(night.date, night.checkoutDate, propertyContext));
     if (nights.length > 1) await wait(250);
   }
   return {
@@ -388,11 +515,11 @@ async function fetchRatePlans(startDate, endDate) {
   };
 }
 
-async function fetchBaseRowsForDates(dates) {
+async function fetchBaseRowsForDates(dates, propertyContext = resolveDefaultProperty()) {
   const uniqueDates = [...new Set(dates.filter(Boolean))].sort();
   const nightlyResults = [];
   for (const date of uniqueDates) {
-    nightlyResults.push(await fetchRatePlansForNight(date, nextDay(date)));
+    nightlyResults.push(await fetchRatePlansForNight(date, nextDay(date), propertyContext));
     if (uniqueDates.length > 1) await wait(250);
   }
   return nightlyResults.flatMap((result) => result.rows);
@@ -477,8 +604,9 @@ function buildAdjacentRowsSnapshot(rows) {
 }
 
 async function createDraftRecord({
-  propertyId = TARGET_PROPERTY_ID,
-  propertyName = TARGET_PROPERTY_NAME,
+  propertyKey = resolveDefaultProperty().key,
+  propertyId = resolveProperty(propertyKey).propertyId,
+  propertyName = resolveProperty(propertyKey).propertyName,
   startDate,
   endDate,
   operator = "local",
@@ -492,6 +620,7 @@ async function createDraftRecord({
   sourceChunkId = null,
   sourceBackupId = null,
 }) {
+  assertSafeRateChanges(changes, { rule });
   if (changes.length > MAX_DRAFT_CHANGES) {
     throw new Error(`Draft has ${changes.length} changes; current limit is ${MAX_DRAFT_CHANGES}.`);
   }
@@ -502,6 +631,7 @@ async function createDraftRecord({
   const draftPayload = buildDraftPayload({
     id,
     backupId: snapshotId,
+    propertyKey,
     propertyId,
     propertyName,
     startDate,
@@ -521,6 +651,7 @@ async function createDraftRecord({
   const backup = {
     id: snapshotId,
     draftId: id,
+    propertyKey,
     propertyId,
     propertyName,
     startDate,
@@ -545,6 +676,7 @@ async function createDraftRecord({
     operator,
     entityType: "draft",
     entityId: id,
+    propertyId,
     startDate,
     endDate,
     payload: {
@@ -561,15 +693,19 @@ async function createDraftRecord({
   return { draft, backup };
 }
 
-async function createDraft({ startDate, endDate, operator = "local", notes = "" }) {
+async function createDraft({ propertyKey = DEFAULT_PROPERTY_KEY, startDate, endDate, operator = "local", notes = "" }) {
   assertDate(startDate, "startDate");
   assertDate(endDate, "endDate");
   assertBatchScope(startDate, endDate, "Draft");
 
-  const fetched = await fetchRatePlans(startDate, endDate);
+  const property = resolveProperty(propertyKey);
+  const fetched = await fetchRatePlans(startDate, endDate, property);
   const changes = plannedChangesFromRows(fetched.rows);
-  const adjacentRows = await fetchBaseRowsForDates(buildAdjacentRiskDates(changes));
+  const adjacentRows = await fetchBaseRowsForDates(buildAdjacentRiskDates(changes), property);
   const { draft } = await createDraftRecord({
+    propertyKey: property.key,
+    propertyId: property.propertyId,
+    propertyName: property.propertyName,
     startDate,
     endDate,
     operator,
@@ -589,8 +725,10 @@ async function listDrafts() {
     files.filter((file) => file.endsWith(".json")).map((file) => readJson(path.join(DRAFTS_DIR, file)))
   );
   return drafts
-    .map(({ id, propertyName, startDate, endDate, createdAt, status, changes, appliedAt }) => ({
+    .map(({ id, propertyKey, propertyId, propertyName, startDate, endDate, createdAt, status, changes, appliedAt }) => ({
       id,
+      propertyKey,
+      propertyId,
       propertyName,
       startDate,
       endDate,
@@ -609,9 +747,11 @@ async function listBackups() {
     files.filter((file) => file.endsWith(".json")).map((file) => readJson(path.join(BACKUPS_DIR, file)))
   );
   return backups
-    .map(({ id, draftId, propertyName, startDate, endDate, createdAt, rollbackChanges }) => ({
+    .map(({ id, draftId, propertyKey, propertyId, propertyName, startDate, endDate, createdAt, rollbackChanges }) => ({
       id,
       draftId,
+      propertyKey,
+      propertyId,
       propertyName,
       startDate,
       endDate,
@@ -666,6 +806,8 @@ function summarizeRun(run) {
   return {
     id: run.id,
     type: run.type,
+    propertyKey: run.propertyKey,
+    propertyId: run.propertyId,
     propertyName: run.propertyName,
     startDate: run.startDate,
     endDate: run.endDate,
@@ -697,11 +839,12 @@ async function saveRun(run) {
   await writeJson(path.join(RUNS_DIR, `${run.id}.json`), run);
 }
 
-async function createRun({ startDate, endDate, operator = "web-app", notes = "", type = "smooth" }) {
+async function createRun({ propertyKey = DEFAULT_PROPERTY_KEY, startDate, endDate, operator = "web-app", notes = "", type = "smooth" }) {
   assertDate(startDate, "startDate");
   assertDate(endDate, "endDate");
   assertRunScope(startDate, endDate);
-  const fetched = await fetchRatePlans(startDate, endDate);
+  const property = resolveProperty(propertyKey);
+  const fetched = await fetchRatePlans(startDate, endDate, property);
   const changes = plannedChangesFromRows(fetched.rows);
   const chunks = chunkChangesForRun(changes).map((chunk, index) => ({
     ...chunk,
@@ -711,8 +854,9 @@ async function createRun({ startDate, endDate, operator = "web-app", notes = "",
   const run = {
     id: batchId("run"),
     type,
-    propertyId: TARGET_PROPERTY_ID,
-    propertyName: TARGET_PROPERTY_NAME,
+    propertyKey: property.key,
+    propertyId: property.propertyId,
+    propertyName: property.propertyName,
     startDate,
     endDate,
     operator,
@@ -739,6 +883,7 @@ async function createRun({ startDate, endDate, operator = "web-app", notes = "",
     operator,
     entityType: "run",
     entityId: run.id,
+    propertyId: run.propertyId,
     startDate,
     endDate,
     payload: {
@@ -766,7 +911,8 @@ async function getBackup(id) {
 async function createRollbackDraftFromBackup(id, operator = "local") {
   const sourceBackup = await getBackup(id);
   assertBatchScope(sourceBackup.startDate, sourceBackup.endDate, "Rollback draft");
-  const fetched = await fetchRatePlans(sourceBackup.startDate, sourceBackup.endDate);
+  const property = resolveProperty(sourceBackup.propertyKey ?? sourceBackup.propertyId);
+  const fetched = await fetchRatePlans(sourceBackup.startDate, sourceBackup.endDate, property);
   const changes = sourceBackup.rollbackChanges.map((rollback) => {
     const liveRow = fetched.rows.find((row) => row.rateID === rollback.rateID && row.date === (rollback.date ?? rollback.startDate));
     return {
@@ -791,6 +937,7 @@ async function createRollbackDraftFromBackup(id, operator = "local") {
   const draftPayload = buildDraftPayload({
     id: rollbackDraftId,
     backupId,
+    propertyKey: property.key,
     propertyId: sourceBackup.propertyId,
     propertyName: sourceBackup.propertyName,
     startDate: sourceBackup.startDate,
@@ -803,16 +950,18 @@ async function createRollbackDraftFromBackup(id, operator = "local") {
     changes: changes.filter((change) => change.changed),
     sourceBackupId: sourceBackup.id,
   });
+  assertSafeRateChanges(draftPayload.changes, { rule: draftPayload.rule });
   if (draftPayload.changes.length > MAX_DRAFT_CHANGES) {
     throw new Error(`Rollback draft has ${draftPayload.changes.length} changes; current limit is ${MAX_DRAFT_CHANGES}.`);
   }
   const hash = hashDraftPayload(draftPayload);
   const draft = { ...draftPayload, hash, appliedAt: null, jobs: [], verification: [] };
-  const adjacentRows = await fetchBaseRowsForDates(buildAdjacentRiskDates(draft.changes));
+  const adjacentRows = await fetchBaseRowsForDates(buildAdjacentRiskDates(draft.changes), property);
   const backup = {
     id: backupId,
     draftId: rollbackDraftId,
     sourceBackupId: sourceBackup.id,
+    propertyKey: property.key,
     propertyId: sourceBackup.propertyId,
     propertyName: sourceBackup.propertyName,
     startDate: sourceBackup.startDate,
@@ -843,6 +992,7 @@ async function createRollbackDraftFromBackup(id, operator = "local") {
     operator,
     entityType: "draft",
     entityId: rollbackDraftId,
+    propertyId: sourceBackup.propertyId,
     startDate: sourceBackup.startDate,
     endDate: sourceBackup.endDate,
     payload: {
@@ -888,6 +1038,7 @@ async function createRollbackRunFromRun(id, operator = "web-app") {
     id: batchId("run"),
     type: "rollback",
     sourceRunId: sourceRun.id,
+    propertyKey: sourceRun.propertyKey ?? resolveProperty(sourceRun.propertyId).key,
     propertyId: sourceRun.propertyId,
     propertyName: sourceRun.propertyName,
     startDate: sourceRun.startDate,
@@ -916,6 +1067,7 @@ async function createRollbackRunFromRun(id, operator = "web-app") {
     operator,
     entityType: "run",
     entityId: rollbackRun.id,
+    propertyId: rollbackRun.propertyId,
     startDate: rollbackRun.startDate,
     endDate: rollbackRun.endDate,
     payload: { sourceRunId: sourceRun.id, chunkCount: rollbackRun.chunkCount, totalChanges: rollbackRun.totalChanges },
@@ -925,6 +1077,7 @@ async function createRollbackRunFromRun(id, operator = "web-app") {
 
 async function createSpillCorrectionDraftFromRun(id, operator = "web-app") {
   const run = await getRun(id);
+  const property = resolveProperty(run.propertyKey ?? run.propertyId);
   if (run.type !== "smooth") throw new Error("Spill correction drafts are only supported for smooth runs.");
   const appliedChunks = run.chunks.filter((chunk) => chunk.status === "applied" && chunk.draftId);
   if (!appliedChunks.length) throw new Error("Run has no applied chunks to audit for spill correction.");
@@ -937,7 +1090,7 @@ async function createSpillCorrectionDraftFromRun(id, operator = "web-app") {
   }
 
   const spillRiskDates = buildAdjacentRiskDates(appliedChunks.flatMap((chunk) => chunk.changes ?? []));
-  const liveAdjacentRows = await fetchBaseRowsForDates(spillRiskDates);
+  const liveAdjacentRows = await fetchBaseRowsForDates(spillRiskDates, property);
   const liveAdjacentByKey = new Map(liveAdjacentRows.map((row) => [`${row.date}::${row.rateID}`, row]));
   const correctionByKey = new Map();
 
@@ -970,9 +1123,12 @@ async function createSpillCorrectionDraftFromRun(id, operator = "web-app") {
 
   const startDate = minDate(corrections.map((item) => item.date));
   const endDate = maxDate(corrections.map((item) => item.date));
-  const fetched = await fetchRatePlans(startDate, endDate);
-  const adjacentRows = await fetchBaseRowsForDates(buildAdjacentRiskDates(corrections));
+  const fetched = await fetchRatePlans(startDate, endDate, property);
+  const adjacentRows = await fetchBaseRowsForDates(buildAdjacentRiskDates(corrections), property);
   const { draft } = await createDraftRecord({
+    propertyKey: property.key,
+    propertyId: run.propertyId,
+    propertyName: run.propertyName,
     startDate,
     endDate,
     operator,
@@ -993,6 +1149,7 @@ async function createSpillCorrectionDraftFromRun(id, operator = "web-app") {
     operator,
     entityType: "draft",
     entityId: draft.id,
+    propertyId: run.propertyId,
     startDate,
     endDate,
     payload: { sourceRunId: run.id, changeCount: draft.changes.length, backupId: draft.backupId },
@@ -1000,14 +1157,14 @@ async function createSpillCorrectionDraftFromRun(id, operator = "web-app") {
   return draft;
 }
 
-async function pollJob(jobReferenceID) {
+async function pollJob(jobReferenceID, propertyContext = resolveDefaultProperty()) {
   for (let attempt = 0; attempt < 40; attempt += 1) {
-    const json = await cloudbeds("getRateJobs", { jobReferenceID });
+    const json = await cloudbeds("getRateJobs", { jobReferenceID }, {}, propertyContext);
     const job = json.data?.[0];
     if (job?.status && !["queued", "processing", "in_progress"].includes(job.status)) return job;
     await wait(1500);
   }
-  const json = await cloudbeds("getRateJobs", { jobReferenceID });
+  const json = await cloudbeds("getRateJobs", { jobReferenceID }, {}, propertyContext);
   return json.data?.[0] ?? { jobReferenceID, status: "unknown", updates: [] };
 }
 
@@ -1104,10 +1261,10 @@ function summarizeVerification(targetedVerification, scopeVerification, adjacent
   };
 }
 
-async function verifyDraftIntegrity(draft, backup) {
+async function verifyDraftIntegrity(draft, backup, propertyContext = resolveDefaultProperty()) {
   const adjacentDates = [...new Set((backup.adjacentRowsSnapshot ?? []).map((row) => row.date))].sort();
-  let readback = await fetchRatePlans(draft.startDate, draft.endDate);
-  let adjacentReadbackRows = adjacentDates.length ? await fetchBaseRowsForDates(adjacentDates) : [];
+  let readback = await fetchRatePlans(draft.startDate, draft.endDate, propertyContext);
+  let adjacentReadbackRows = adjacentDates.length ? await fetchBaseRowsForDates(adjacentDates, propertyContext) : [];
   let targetedVerification = buildVerification(draft.changes, readback.rows);
   let scopeVerification = buildScopeVerification(backup.baseRowsSnapshot ?? [], readback.rows);
   let adjacentVerification = buildAdjacentVerification(backup.adjacentRowsSnapshot ?? [], draft.changes, adjacentReadbackRows);
@@ -1116,8 +1273,8 @@ async function verifyDraftIntegrity(draft, backup) {
   for (let attempt = 0; attempt < VERIFY_RETRY_ATTEMPTS; attempt += 1) {
     if (summary.allVerified) break;
     await wait(VERIFY_RETRY_DELAY_MS);
-    readback = await fetchRatePlans(draft.startDate, draft.endDate);
-    adjacentReadbackRows = adjacentDates.length ? await fetchBaseRowsForDates(adjacentDates) : [];
+    readback = await fetchRatePlans(draft.startDate, draft.endDate, propertyContext);
+    adjacentReadbackRows = adjacentDates.length ? await fetchBaseRowsForDates(adjacentDates, propertyContext) : [];
     targetedVerification = buildVerification(draft.changes, readback.rows);
     scopeVerification = buildScopeVerification(backup.baseRowsSnapshot ?? [], readback.rows);
     adjacentVerification = buildAdjacentVerification(backup.adjacentRowsSnapshot ?? [], draft.changes, adjacentReadbackRows);
@@ -1130,6 +1287,7 @@ async function verifyDraftIntegrity(draft, backup) {
 async function applyDraft(id, confirmation) {
   const draft = await getDraft(id);
   const backup = await getBackup(draft.backupId);
+  const property = resolveProperty(draft.propertyKey ?? draft.propertyId);
   if (!WRITES_ENABLED) throw new Error("Writes are disabled. Set ENABLE_CLOUDBEDS_WRITES=true to apply drafts.");
   if (draft.status === "applied") throw new Error("Draft has already been applied.");
   if (confirmation !== "yes") throw new Error("Apply confirmation is required.");
@@ -1139,10 +1297,12 @@ async function applyDraft(id, confirmation) {
   if (draft.changes.some((change) => change.conflict)) {
     throw new Error("Draft has rollback conflicts; review before applying.");
   }
+  assertSafeRateChanges(draft.changes, { rule: draft.rule });
 
   const payloadForHash = buildDraftPayload({
     id: draft.id,
     backupId: draft.backupId,
+    propertyKey: draft.propertyKey,
     propertyId: draft.propertyId,
     propertyName: draft.propertyName,
     startDate: draft.startDate,
@@ -1163,6 +1323,7 @@ async function applyDraft(id, confirmation) {
     operator: draft.operator,
     entityType: "draft",
     entityId: draft.id,
+    propertyId: draft.propertyId,
     startDate: draft.startDate,
     endDate: draft.endDate,
     payload: { changeCount: draft.changes.length, hash: draft.hash },
@@ -1178,17 +1339,18 @@ async function applyDraft(id, confirmation) {
         "rates[0][interval][0][endDate]": cloudbedsWriteEndDate(change),
         "rates[0][interval][0][rate]": change.proposedRate.toFixed(2),
       },
-      { method: "POST" }
+      { method: "POST" },
+      property
     );
     jobs.push({ rateID: change.rateID, proposedRate: change.proposedRate, jobReferenceID: response.jobReferenceID });
   }
 
   const completedJobs = [];
   for (const job of jobs) {
-    completedJobs.push({ ...job, cloudbedsJob: await pollJob(job.jobReferenceID) });
+    completedJobs.push({ ...job, cloudbedsJob: await pollJob(job.jobReferenceID, property) });
   }
 
-  const verificationResult = await verifyDraftIntegrity(draft, backup);
+  const verificationResult = await verifyDraftIntegrity(draft, backup, property);
   const verification = verificationResult.targetedVerification;
 
   const applied = {
@@ -1208,6 +1370,7 @@ async function applyDraft(id, confirmation) {
     operator: draft.operator,
     entityType: "draft",
     entityId: draft.id,
+    propertyId: draft.propertyId,
     startDate: draft.startDate,
     endDate: draft.endDate,
     payload: {
@@ -1256,7 +1419,11 @@ async function draftFromRunChunk(run, chunk, options = {}) {
       nights: [...relevantDates].sort().map((date) => ({ date, checkoutDate: nextDay(date), response: null })),
     };
   const adjacentRows = options.adjacentRows ?? [];
+  const property = resolveProperty(run.propertyKey ?? run.propertyId);
   const { draft, backup } = await createDraftRecord({
+    propertyKey: property.key,
+    propertyId: run.propertyId,
+    propertyName: run.propertyName,
     startDate,
     endDate,
     operator: run.operator,
@@ -1288,6 +1455,31 @@ function updateRunProgress(run, updates = {}) {
   return run.progress;
 }
 
+function terminalRunChunks(run) {
+  return run.chunks.every((chunk) => ["applied", "skipped"].includes(chunk.status));
+}
+
+function finalizeRunStatus(run) {
+  if (terminalRunChunks(run)) {
+    run.status = "applied";
+    updateRunProgress(run, {
+      phase: "applied",
+      failedChunkSequence: null,
+      activeChunkSequence: null,
+      message: `Run completed with ${run.chunks.filter((chunk) => chunk.status === "applied").length} applied chunk(s) and ${run.chunks.filter((chunk) => chunk.status === "skipped").length} skipped chunk(s).`,
+    });
+    return;
+  }
+
+  run.status = "paused";
+  updateRunProgress(run, {
+    phase: "paused",
+    failedChunkSequence: null,
+    activeChunkSequence: null,
+    message: "Selected failed chunk was reconciled. Resume the run to continue remaining planned chunks.",
+  });
+}
+
 function findLiveRow(rows, change) {
   return rows.find((row) => row.rateID === change.rateID && row.date === change.date);
 }
@@ -1316,8 +1508,9 @@ function categorizeChunkDrift(run, drifted = []) {
 }
 
 async function assessChunkLiveState(run, chunk) {
-  const fetched = await fetchRatePlans(chunk.startDate, chunk.endDate);
-  const adjacentRows = await fetchBaseRowsForDates(buildAdjacentRiskDates(chunk.changes));
+  const property = resolveProperty(run.propertyKey ?? run.propertyId);
+  const fetched = await fetchRatePlans(chunk.startDate, chunk.endDate, property);
+  const adjacentRows = await fetchBaseRowsForDates(buildAdjacentRiskDates(chunk.changes), property);
   const actionableChanges = [];
   const alreadySmooth = [];
   const drifted = [];
@@ -1358,6 +1551,7 @@ async function assessChunkLiveState(run, chunk) {
 
 async function applyRun(id, options = {}) {
   const run = await getRun(id);
+  resolveProperty(run.propertyKey ?? run.propertyId);
   if (!WRITES_ENABLED) throw new Error("Writes are disabled. Set ENABLE_CLOUDBEDS_WRITES=true to apply runs.");
   if (run.status === "applied") throw new Error("Run has already been applied.");
   const mode = options.mode === "retry_failed_chunk" ? "retry_failed_chunk" : "resume";
@@ -1380,6 +1574,7 @@ async function applyRun(id, options = {}) {
     operator: run.operator,
     entityType: "run",
     entityId: run.id,
+    propertyId: run.propertyId,
     startDate: run.startDate,
     endDate: run.endDate,
     payload: { chunkCount: run.chunkCount, totalChanges: run.totalChanges, type: run.type, mode },
@@ -1401,6 +1596,7 @@ async function applyRun(id, options = {}) {
         operator: run.operator,
         entityType: "run",
         entityId: run.id,
+        propertyId: run.propertyId,
         startDate: chunk.startDate,
         endDate: chunk.endDate,
         payload: { chunkId: chunk.id, chunkSequence: chunk.sequence, changeCount: chunk.changeCount },
@@ -1441,6 +1637,7 @@ async function applyRun(id, options = {}) {
           operator: run.operator,
           entityType: "run",
           entityId: run.id,
+          propertyId: run.propertyId,
           startDate: chunk.startDate,
           endDate: chunk.endDate,
           payload: {
@@ -1472,6 +1669,7 @@ async function applyRun(id, options = {}) {
           operator: run.operator,
           entityType: "run",
           entityId: run.id,
+          propertyId: run.propertyId,
           startDate: chunk.startDate,
           endDate: chunk.endDate,
           payload: {
@@ -1528,6 +1726,7 @@ async function applyRun(id, options = {}) {
         operator: run.operator,
         entityType: "run",
         entityId: run.id,
+        propertyId: run.propertyId,
         startDate: chunk.startDate,
         endDate: chunk.endDate,
         payload: {
@@ -1552,7 +1751,7 @@ async function applyRun(id, options = {}) {
         message:
           applied.status === "applied"
             ? `Chunk ${chunk.sequence} finished and verified ${chunk.verifiedCount}/${draft.changes.length} row(s).`
-            : `Chunk ${chunk.sequence} applied but verification found additional mismatches outside the targeted rows.`,
+            : `Chunk ${chunk.sequence} applied but verification found mismatches: ${describeVerificationFailure(applied.verificationSummary ?? {})}`,
       });
       await saveRun(run);
       auditEvent({
@@ -1560,6 +1759,7 @@ async function applyRun(id, options = {}) {
         operator: run.operator,
         entityType: "run",
         entityId: run.id,
+        propertyId: run.propertyId,
         startDate: chunk.startDate,
         endDate: chunk.endDate,
         payload: {
@@ -1579,6 +1779,7 @@ async function applyRun(id, options = {}) {
           operator: run.operator,
           entityType: "run",
           entityId: run.id,
+          propertyId: run.propertyId,
           startDate: run.startDate,
           endDate: run.endDate,
           payload: { status: run.status, failedChunkId: chunk.id, chunkSequence: chunk.sequence },
@@ -1602,6 +1803,7 @@ async function applyRun(id, options = {}) {
         operator: run.operator,
         entityType: "run",
         entityId: run.id,
+        propertyId: run.propertyId,
         startDate: run.startDate,
         endDate: run.endDate,
         payload: { error: error.message, chunkId: chunk.id, chunkSequence: chunk.sequence },
@@ -1610,22 +1812,17 @@ async function applyRun(id, options = {}) {
     }
   }
 
-  run.status = "applied";
-  updateRunProgress(run, {
-    phase: "applied",
-    failedChunkSequence: null,
-    activeChunkSequence: null,
-    message: `Run completed with ${run.chunks.filter((chunk) => chunk.status === "applied").length} applied chunk(s) and ${run.chunks.filter((chunk) => chunk.status === "skipped").length} skipped chunk(s).`,
-  });
+  finalizeRunStatus(run);
   await saveRun(run);
   auditEvent({
     type: "run_apply_finished",
     operator: run.operator,
     entityType: "run",
     entityId: run.id,
+    propertyId: run.propertyId,
     startDate: run.startDate,
     endDate: run.endDate,
-    payload: { status: run.status, chunkCount: run.chunkCount, totalChanges: run.totalChanges },
+    payload: { status: run.status, chunkCount: run.chunkCount, totalChanges: run.totalChanges, mode },
   });
   return run;
 }
@@ -1635,9 +1832,12 @@ app.use(express.json({ limit: "2mb" }));
 app.use(express.static(PUBLIC_DIR));
 
 app.get("/api/config", (_req, res) => {
+  const defaultProperty = resolveDefaultProperty();
   res.json({
-    propertyId: TARGET_PROPERTY_ID,
-    propertyName: TARGET_PROPERTY_NAME,
+    defaultPropertyKey: defaultProperty.key,
+    propertyId: defaultProperty.propertyId,
+    propertyName: defaultProperty.propertyName,
+    properties: PROPERTY_CONFIGS.filter((property) => property.apiKey && property.propertyId).map(publicProperty),
     writesEnabled: WRITES_ENABLED,
     safetyMetadata: SAFETY_METADATA,
     limits: {
@@ -1648,20 +1848,25 @@ app.get("/api/config", (_req, res) => {
       maxApplyChanges: MAX_APPLY_CHANGES,
       runChunkMaxChanges: RUN_CHUNK_MAX_CHANGES,
       runChunkMaxNights: RUN_CHUNK_MAX_NIGHTS,
+      minAllowedRate: MIN_ALLOWED_RATE,
+      maxAllowedRate: MAX_ALLOWED_RATE,
+      maxSmoothRateDecrease: MAX_SMOOTH_RATE_DECREASE,
     },
   });
 });
 
 app.get("/api/rates", async (req, res) => {
   try {
+    const property = resolveProperty(req.query.propertyKey ?? DEFAULT_PROPERTY_KEY);
     const startDate = String(req.query.startDate ?? "");
     const endDate = String(req.query.endDate ?? nextDay(startDate));
     assertDate(startDate, "startDate");
     assertDate(endDate, "endDate");
-    const fetched = await fetchRatePlans(startDate, endDate);
+    const fetched = await fetchRatePlans(startDate, endDate, property);
     res.json({
-      propertyId: TARGET_PROPERTY_ID,
-      propertyName: TARGET_PROPERTY_NAME,
+      propertyKey: property.key,
+      propertyId: property.propertyId,
+      propertyName: property.propertyName,
       startDate,
       endDate,
       rows: fetched.rows.map(({ raw, ...row }) => ({

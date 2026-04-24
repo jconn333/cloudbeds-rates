@@ -66,4 +66,33 @@ if ! grep -q "\"propertyID\":[[:space:]]*\"${CLOUDBEDS_PROPERTY_ID}\"" /tmp/clou
 fi
 
 ok "Cloudbeds auth + property mapping verified."
+
+check_named_property() {
+  local label="$1"
+  local api_key="$2"
+  local property_id="$3"
+
+  if [[ -z "${api_key}" && -z "${property_id}" ]]; then
+    return
+  fi
+  [[ -n "${api_key}" ]] || fail "${label} API key is missing."
+  [[ -n "${property_id}" ]] || fail "${label} property ID is missing."
+
+  local response_file="/tmp/cloudbeds_preflight_${label//[^A-Za-z0-9]/_}.json"
+  local http_code
+  http_code="$(
+    curl -sS -o "${response_file}" -w "%{http_code}" \
+      -G "https://api.cloudbeds.com/api/v1.3/getHotels" \
+      -H "x-api-key: ${api_key}" \
+      --data-urlencode "page=1" \
+      --data-urlencode "pageSize=200"
+  )"
+  [[ "${http_code}" == "200" ]] || fail "${label} getHotels returned HTTP ${http_code}."
+  grep -q '"success":[[:space:]]*true' "${response_file}" || fail "${label} response success flag is not true."
+  grep -q "\"propertyID\":[[:space:]]*\"${property_id}\"" "${response_file}" || fail "${label} property ID was not found in getHotels response."
+  ok "${label} auth + property mapping verified."
+}
+
+check_named_property "Berlin Encore" "${CLOUDBEDS_BERLIN_ENCORE_API_KEY:-}" "${CLOUDBEDS_BERLIN_ENCORE_PROPERTY_ID:-}"
+check_named_property "Berlin Resort" "${CLOUDBEDS_BERLIN_RESORT_API_KEY:-}" "${CLOUDBEDS_BERLIN_RESORT_PROPERTY_ID:-}"
 echo "PASS: Preflight checks completed."

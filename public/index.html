@@ -17,6 +17,10 @@
 
     <main>
       <section class="control-band">
+        <div class="field property-field">
+          <label for="propertySelect">Property</label>
+          <select id="propertySelect"></select>
+        </div>
         <div class="field">
           <label for="startDate">Start night</label>
           <input id="startDate" type="date">
@@ -29,13 +33,24 @@
           <label for="notes">Batch note</label>
           <input id="notes" type="text" placeholder="Optional note for audit trail">
         </div>
-        <button id="fetchRates" type="button">Fetch Rates</button>
-        <button id="createDraft" type="button" disabled>Create Draft</button>
-        <button id="createRun" type="button" class="secondary" disabled>Create Run</button>
+        <div class="action-field">
+          <button id="fetchRates" type="button" class="secondary">Fetch Rates</button>
+          <button id="createRun" type="button" disabled>Create Run</button>
+        </div>
       </section>
 
       <section class="status-row">
         <div id="message" class="message">Choose dates, then fetch rates.</div>
+        <div id="operationProgress" class="operation-progress" hidden>
+          <div class="operation-progress-head">
+            <strong id="operationProgressLabel">Working...</strong>
+            <span id="operationProgressPercent">0%</span>
+          </div>
+          <div class="progress-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <div id="operationProgressFill" class="progress-fill"></div>
+          </div>
+          <div id="operationProgressDetail" class="operation-progress-detail"></div>
+        </div>
       </section>
 
       <section class="layout">

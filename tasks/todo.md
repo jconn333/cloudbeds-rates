@@ -1,5 +1,33 @@
 # Task Notes
 
+## 2026-04-23 Progress bar for fetches and chunked runs
+
+- [x] Add a reusable operation progress bar near the status message.
+- [x] Fetch nightly rate ranges one night at a time so percent complete can reflect real progress.
+- [x] Poll selected run status while chunked applies/retries are in flight and update percent complete from chunk state.
+- [x] Verify syntax, preflight, and browser rendering.
+
+Result: Fetching now shows a percentage bar that advances by completed nights and finishes at 100%. Chunked run apply/retry actions poll the saved run while the write request is in flight and update the same progress bar from completed/applied/skipped chunks plus the active chunk. Verified syntax, preflight, browser rendering, and a real two-night fetch progress flow.
+
+## 2026-04-23 Berlin Resort property support
+
+- [x] Confirm Berlin Resort Cloudbeds property ID from the new API key.
+- [x] Add selectable multi-property config without breaking the existing Encore defaults.
+- [x] Thread selected property through live reads, drafts, runs, backups, and write verification.
+- [x] Update docs/env examples and run preflight/tests.
+
+Result: Berlin Resort verified as Cloudbeds property `304361`. The app now exposes Encore and Resort in a property selector, uses the selected property's API key for live reads and new drafts/runs, and uses the saved draft/run property context for writes, polling, rollback, and verification. `node --check server.mjs`, `node --check public/app.js`, `npm run preflight`, direct `/api/rates?propertyKey=berlin-resort`, and a browser selector/fetch check all passed.
+
+Follow-up UI note: Removed the top-level `Create Draft` button from the toolbar and made `Create Run` the primary workflow action next to `Fetch Rates`. Drafts remain internal safety artifacts for runs, rollbacks, and verification. Rechecked syntax and browser rendering after the change.
+
+Follow-up safety note:
+
+- [x] Add write-time absolute rate bounds so drafts cannot send zero, thousand-dollar, or non-numeric proposed rates.
+- [x] Add a smooth-draft max-decrease guard so normal smoothing cannot change any row by more than $0.99.
+- [x] Verify syntax, preflight, and synthetic unsafe-draft rejections.
+
+Result: The server now rejects unsafe proposed rates before hash verification or any Cloudbeds write loop. Synthetic apply checks rejected both `$1000.00` as outside the allowed absolute range and a `$2.08` smooth decrease as exceeding the `$0.99` smoothing cap.
+
 ## 2026-04-23 Adjacent verification overlap fix
 
 - [x] Confirm why the latest March 2027 run paused after chunk 1.
