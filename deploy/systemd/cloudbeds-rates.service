@@ -1,0 +1,19 @@
+[Unit]
+Description=Cloudbeds Rates web UI
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cloudbeds-rates
+Group=cloudbeds-rates
+WorkingDirectory=/opt/cloudbeds-rates
+EnvironmentFile=/etc/cloudbeds-rates.env
+ExecStart=/usr/bin/npm start
+Restart=on-failure
+RestartSec=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

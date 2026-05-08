@@ -3,9 +3,15 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22.5.0"
+  },
   "scripts": {
     "start": "node --no-warnings server.mjs",
     "dev": "node --no-warnings --watch server.mjs",
+    "daily:plan": "node --no-warnings scripts/daily-run.mjs",
+    "daily:apply": "node --no-warnings scripts/daily-run.mjs --apply",
+    "backup:rates": "node --no-warnings scripts/backup-rates.mjs",
     "preflight": "bash scripts/preflight.sh"
   },
   "dependencies": {

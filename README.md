@@ -12,6 +12,78 @@ npm run dev
 
 Open `http://localhost:3787`.
 
+## Daily Automation
+
+Plan the daily smoothing run without live writes:
+
+```sh
+npm run daily:plan
+```
+
+Apply the daily run:
+
+```sh
+npm run daily:apply
+```
+
+Live writes still require `ENABLE_CLOUDBEDS_WRITES=true`; the apply command alone
+is not enough. The daily runner uses `DAILY_RUN_PROPERTIES`,
+`DAILY_RUN_DAYS_AHEAD`, and `DAILY_RUN_OPERATOR` from the environment. It stores
+an automation key on each run, uses a per-property lock file, and refuses to
+apply paused or otherwise non-planned runs unattended.
+
+For a DigitalOcean/systemd deployment, see
+`docs/digitalocean-vps-deploy.md`.
+
+The server binds to `127.0.0.1` by default. Put nginx, HTTPS, and authentication
+in front of it before exposing the UI outside the VPS.
+
+## Current Production Setup
+
+The DigitalOcean VPS runs this app from `/opt/cloudbeds-rates` with secrets in
+`/etc/cloudbeds-rates.env` and durable state in `/opt/cloudbeds-rates/data`.
+
+There are two systemd surfaces:
+
+- `cloudbeds-rates.service` runs the local-only web UI on `127.0.0.1:3787`.
+- `cloudbeds-rates-daily.timer` schedules `cloudbeds-rates-daily.service`.
+
+The current rollout mode is unattended dry-run observation. The daily service has
+a systemd drop-in at
+`/etc/systemd/system/cloudbeds-rates-daily.service.d/plan-only.conf` that replaces
+the base `daily:apply` command with:
+
+```sh
+npm run daily:plan
+```
+
+Keep `ENABLE_CLOUDBEDS_WRITES=false` while this drop-in is active. In this mode
+the timer can create/reuse planned runs every day, but it cannot write rates.
+Codex reviews the VPS status, timer logs, recent runs, verification state, and
+backup presence daily in the project thread.
+
+To inspect the UI from a local machine:
+
+```sh
+ssh -L 3787:127.0.0.1:3787 root@68.183.100.227
+```
+
+Then open `http://127.0.0.1:3787`.
+
+Before any live write test, save a scope backup:
+
+```sh
+npm run backup:rates -- --property berlin-resort --start-date 2027-02-01 --end-date 2027-02-28
+```
+
+Live writes require all of these to be true:
+
+- `ENABLE_CLOUDBEDS_WRITES=true`
+- the command is `npm run daily:apply`
+- the target run is still `planned`
+- the run passes pre-apply live drift checks
+- Cloudbeds readback and adjacent-night verification pass after apply
+
 The app can switch between configured Cloudbeds properties. Keep the legacy
 `CLOUDBEDS_API_KEY` / `CLOUDBEDS_PROPERTY_ID` values for the default property,
 and add named aliases such as `CLOUDBEDS_BERLIN_ENCORE_*` and

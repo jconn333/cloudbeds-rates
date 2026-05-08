@@ -1,5 +1,35 @@
 # Task Notes
 
+## 2026-05-07 DigitalOcean VPS daily runner
+
+- [x] Record a concrete migration plan for running Cloudbeds smoothing daily without a local machine.
+- [x] Add a headless daily runner that reuses the existing run/apply safety path.
+- [x] Add deployment docs and systemd service/timer templates for the VPS.
+- [x] Verify syntax and preflight checks after the runner/deploy changes.
+
+Planned shape: Keep the Express UI as the review/control surface, add a deterministic CLI for daily automation, run both on the DigitalOcean VPS with durable `data/` storage, and keep live writes gated by `ENABLE_CLOUDBEDS_WRITES=true` plus an explicit CLI `--apply` flag.
+
+Result: Added `scripts/daily-run.mjs`, `npm run daily:plan`, `npm run daily:apply`, `CLOUDBEDS_RATES_DATA_DIR`, per-property locks, daily-run idempotency keys, DigitalOcean/systemd templates, and `docs/digitalocean-vps-deploy.md`. Verified JavaScript syntax, live Cloudbeds preflight, a one-night Encore plan with 10 changes, a one-night Resort plan with 0 changes, and idempotent reuse of the existing daily Encore plan. Deployed the app to the `fivestar-agents` DigitalOcean VPS at `/opt/cloudbeds-rates`, installed `/etc/cloudbeds-rates.env` with writes disabled, started/enabled `cloudbeds-rates.service`, bound the UI to `127.0.0.1:3787`, verified `/api/config` locally on the VPS, and left `cloudbeds-rates-daily.timer` disabled until live VPS writes are approved.
+
+Follow-up live test:
+
+- [x] Add a backup-only rate snapshot command before live VPS writes.
+- [x] Save Berlin Resort February 2027 backup before changing any rates.
+- [x] Apply one controlled Berlin Resort night manually with writes temporarily enabled.
+- [x] Verify targeted readback and adjacent-night checks.
+- [x] Return VPS writes to disabled and keep the daily timer disabled.
+
+Result: Saved full Berlin Resort February 2027 snapshot `backup_20260508025139_3e397d14` with 6,796 normalized rows, 588 base-rate snapshot rows, and hash `79c5c0a858a850b6e87b0fc506d97d14672caf75a237861d95a73a4f1bd3b0a7`. Temporarily enabled VPS writes for one manual run, applied `run_20260508025157_1666da43` for Berlin Resort `2027-02-05`, and changed 21 base-rate rows from cents to whole-dollar rates. Draft `draft_20260508025223_e88a1ddd` and backup `backup_20260508025223_e88a1ddd` were created for the live write. Verification passed for 21/21 targeted rows, 21/21 scoped rows, and 21/21 adjacent Feb 6 rows with 0 suspected spill rows. VPS `ENABLE_CLOUDBEDS_WRITES=false` and `cloudbeds-rates-daily.timer` remains disabled.
+
+Follow-up unattended review rollout:
+
+- [x] Set the VPS daily systemd service to plan-only using `/etc/systemd/system/cloudbeds-rates-daily.service.d/plan-only.conf`.
+- [x] Keep `/etc/cloudbeds-rates.env` at `ENABLE_CLOUDBEDS_WRITES=false`.
+- [x] Enable `cloudbeds-rates-daily.timer` for unattended dry-run observation.
+- [x] Verify the web service remains local-only on `127.0.0.1:3787`.
+
+Result: `cloudbeds-rates-daily.timer` is enabled and active, with the next plan-only run scheduled for `2026-05-08 05:17:31 EDT`. The effective service command is `npm run daily:plan`, not `daily:apply`; the app API still reports `writesEnabled: false`.
+
 ## 2026-04-23 Progress bar for fetches and chunked runs
 
 - [x] Add a reusable operation progress bar near the status message.

@@ -7,12 +7,16 @@ import { fileURLToPath } from "node:url";
 import express from "express";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DATA_DIR = path.join(__dirname, "data");
+const DATA_DIR = process.env.CLOUDBEDS_RATES_DATA_DIR
+  ? path.resolve(process.env.CLOUDBEDS_RATES_DATA_DIR)
+  : path.join(__dirname, "data");
 const DRAFTS_DIR = path.join(DATA_DIR, "drafts");
 const BACKUPS_DIR = path.join(DATA_DIR, "backups");
 const RUNS_DIR = path.join(DATA_DIR, "runs");
+const LOCKS_DIR = path.join(DATA_DIR, "locks");
 const AUDIT_DB = path.join(DATA_DIR, "audit.sqlite");
 const PUBLIC_DIR = path.join(__dirname, "public");
+const HOST = process.env.HOST ?? "127.0.0.1";
 const PORT = Number(process.env.PORT ?? "3787");
 const CLOUDBEDS_BASE_URL = "https://api.cloudbeds.com/api/v1.3";
 
@@ -309,6 +313,12 @@ async function ensureDataDirs() {
   await fs.mkdir(DRAFTS_DIR, { recursive: true });
   await fs.mkdir(BACKUPS_DIR, { recursive: true });
   await fs.mkdir(RUNS_DIR, { recursive: true });
+  await fs.mkdir(LOCKS_DIR, { recursive: true });
+}
+
+async function initializeStorage() {
+  await ensureDataDirs();
+  if (!auditDb) initAuditDb();
 }
 
 function initAuditDb() {
@@ -718,6 +728,60 @@ async function createDraft({ propertyKey = DEFAULT_PROPERTY_KEY, startDate, endD
   return draft;
 }
 
+async function createRateBackup({ propertyKey = DEFAULT_PROPERTY_KEY, startDate, endDate, operator = "backup-cli", notes = "" }) {
+  await initializeStorage();
+  assertDate(startDate, "startDate");
+  assertDate(endDate, "endDate");
+  assertFetchScope(startDate, endDate);
+
+  const property = resolveProperty(propertyKey);
+  const fetched = await fetchRatePlans(startDate, endDate, property);
+  const id = batchId("backup");
+  const createdAt = isoNow();
+  const backupCore = {
+    id,
+    draftId: null,
+    backupType: "rate_snapshot",
+    propertyKey: property.key,
+    propertyId: property.propertyId,
+    propertyName: property.propertyName,
+    startDate,
+    endDate,
+    createdAt,
+    operator,
+    notes,
+    safetyMetadata: SAFETY_METADATA,
+    normalizedRows: fetched.rows,
+    rawCloudbedsResponse: fetched.raw,
+    baseRowsSnapshot: buildBaseRowsSnapshot(fetched.rows, []),
+    adjacentRowsSnapshot: [],
+    rollbackChanges: [],
+  };
+  const backup = {
+    ...backupCore,
+    hash: crypto.createHash("sha256").update(JSON.stringify(backupCore)).digest("hex"),
+  };
+
+  await writeJson(path.join(BACKUPS_DIR, `${id}.json`), backup);
+  auditEvent({
+    type: "rate_backup_created",
+    operator,
+    entityType: "backup",
+    entityId: id,
+    propertyId: property.propertyId,
+    startDate,
+    endDate,
+    payload: {
+      backupType: "rate_snapshot",
+      notes,
+      normalizedRowCount: fetched.rows.length,
+      baseRowsSnapshotCount: backup.baseRowsSnapshot.length,
+      hash: backup.hash,
+    },
+  });
+  return backup;
+}
+
 async function listDrafts() {
   await ensureDataDirs();
   const files = await fs.readdir(DRAFTS_DIR).catch(() => []);
@@ -809,6 +873,7 @@ function summarizeRun(run) {
     propertyKey: run.propertyKey,
     propertyId: run.propertyId,
     propertyName: run.propertyName,
+    automationKey: run.automationKey ?? null,
     startDate: run.startDate,
     endDate: run.endDate,
     createdAt: run.createdAt,
@@ -839,9 +904,19 @@ async function saveRun(run) {
   await writeJson(path.join(RUNS_DIR, `${run.id}.json`), run);
 }
 
-async function createRun({ propertyKey = DEFAULT_PROPERTY_KEY, startDate, endDate, operator = "web-app", notes = "", type = "smooth" }) {
+async function createRun({
+  propertyKey = DEFAULT_PROPERTY_KEY,
+  startDate,
+  endDate,
+  operator = "web-app",
+  notes = "",
+  type = "smooth",
+  automationKey = null,
+}) {
+  await initializeStorage();
   assertDate(startDate, "startDate");
   assertDate(endDate, "endDate");
+  if (type !== "smooth") throw new Error(`Unsupported run type "${type}".`);
   assertRunScope(startDate, endDate);
   const property = resolveProperty(propertyKey);
   const fetched = await fetchRatePlans(startDate, endDate, property);
@@ -857,6 +932,7 @@ async function createRun({ propertyKey = DEFAULT_PROPERTY_KEY, startDate, endDat
     propertyKey: property.key,
     propertyId: property.propertyId,
     propertyName: property.propertyName,
+    automationKey,
     startDate,
     endDate,
     operator,
@@ -1550,6 +1626,7 @@ async function assessChunkLiveState(run, chunk) {
 }
 
 async function applyRun(id, options = {}) {
+  await initializeStorage();
   const run = await getRun(id);
   resolveProperty(run.propertyKey ?? run.propertyId);
   if (!WRITES_ENABLED) throw new Error("Writes are disabled. Set ENABLE_CLOUDBEDS_WRITES=true to apply runs.");
@@ -2019,8 +2096,32 @@ app.use((_req, res) => {
   res.sendFile(path.join(PUBLIC_DIR, "index.html"));
 });
 
-await ensureDataDirs();
-initAuditDb();
-app.listen(PORT, () => {
-  console.log(`Cloudbeds Rates app running at http://localhost:${PORT}`);
-});
+async function startServer() {
+  await initializeStorage();
+  return app.listen(PORT, HOST, () => {
+    console.log(`Cloudbeds Rates app running at http://${HOST}:${PORT}`);
+  });
+}
+
+function getDataDir() {
+  return DATA_DIR;
+}
+
+export {
+  app,
+  applyRun,
+  createRateBackup,
+  createRun,
+  getDataDir,
+  getRun,
+  initializeStorage,
+  listRuns,
+  resolveDefaultProperty,
+  resolveProperty,
+  startServer,
+};
+
+const isMain = process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+if (isMain) {
+  await startServer();
+}

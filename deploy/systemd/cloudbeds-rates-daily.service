@@ -1,0 +1,14 @@
+[Unit]
+Description=Cloudbeds Rates daily smoothing run
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=cloudbeds-rates
+Group=cloudbeds-rates
+WorkingDirectory=/opt/cloudbeds-rates
+EnvironmentFile=/etc/cloudbeds-rates.env
+ExecStart=/usr/bin/npm run daily:apply
+NoNewPrivileges=true
+PrivateTmp=true
