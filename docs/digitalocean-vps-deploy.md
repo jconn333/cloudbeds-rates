@@ -50,7 +50,8 @@ Recommended VPS-specific values:
 ```sh
 CLOUDBEDS_RATES_DATA_DIR=/opt/cloudbeds-rates/data
 DAILY_RUN_PROPERTIES=berlin-encore,berlin-resort
-DAILY_RUN_DAYS_AHEAD=365
+DAILY_RUN_START_OFFSET_DAYS=364
+DAILY_RUN_DAYS_AHEAD=1
 DAILY_RUN_OPERATOR=digitalocean-daily
 ENABLE_CLOUDBEDS_WRITES=false
 HOST=127.0.0.1
@@ -60,6 +61,11 @@ PORT=3787
 Leave `ENABLE_CLOUDBEDS_WRITES=false` for the first VPS smoke test. The daily
 runner also requires the explicit `daily:apply` command before writes can happen,
 so both gates must be open.
+
+The recommended live rollout starts far in the future and works backward toward
+near-term dates. `DAILY_RUN_START_OFFSET_DAYS=364` plus `DAILY_RUN_DAYS_AHEAD=1`
+means each daily run covers one night about a year out; the next day's run moves
+one night closer to today.
 
 ## Install services
 

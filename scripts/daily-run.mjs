@@ -19,6 +19,8 @@ function usage() {
 Options:
   --property <key>       Cloudbeds property key. Repeat or comma-separate for multiple properties.
   --start-date <date>    First inclusive night to smooth. Defaults to tomorrow UTC.
+  --start-offset-days <n>
+                         First inclusive night as n days from today's UTC date.
   --days-ahead <n>       Inclusive night count. Defaults to DAILY_RUN_DAYS_AHEAD or 365.
   --operator <name>      Operator label for run/audit history. Defaults to daily-run.
   --apply                Apply the planned run. Also requires ENABLE_CLOUDBEDS_WRITES=true.
@@ -34,6 +36,10 @@ function parseArgs(argv) {
     operator: process.env.DAILY_RUN_OPERATOR ?? "daily-run",
     properties: [],
     startDate: process.env.DAILY_RUN_START_DATE ?? null,
+    startOffsetDays:
+      process.env.DAILY_RUN_START_OFFSET_DAYS === undefined
+        ? null
+        : Number(process.env.DAILY_RUN_START_OFFSET_DAYS),
     daysAhead: Number(process.env.DAILY_RUN_DAYS_AHEAD ?? "365"),
   };
 
@@ -55,6 +61,8 @@ function parseArgs(argv) {
       options.properties.push(...next().split(",").map((value) => value.trim()).filter(Boolean));
     } else if (arg === "--start-date") {
       options.startDate = next();
+    } else if (arg === "--start-offset-days") {
+      options.startOffsetDays = Number(next());
     } else if (arg === "--days-ahead") {
       options.daysAhead = Number(next());
     } else if (arg === "--operator") {
@@ -71,6 +79,15 @@ function parseArgs(argv) {
 
   if (!Number.isInteger(options.daysAhead) || options.daysAhead <= 0) {
     throw new Error("--days-ahead must be a positive integer.");
+  }
+  if (options.startDate && options.startOffsetDays !== null) {
+    throw new Error("Use either --start-date or --start-offset-days, not both.");
+  }
+  if (
+    options.startOffsetDays !== null &&
+    (!Number.isInteger(options.startOffsetDays) || options.startOffsetDays < 0)
+  ) {
+    throw new Error("--start-offset-days must be a non-negative integer.");
   }
 
   return options;
@@ -143,11 +160,14 @@ async function findExistingRun(automationKey) {
 
 async function runProperty(propertyKey, options) {
   const property = resolveProperty(propertyKey);
-  const startDate = options.startDate ?? dateDaysFromNow(1);
+  const startDate =
+    options.startDate ??
+    (options.startOffsetDays === null ? dateDaysFromNow(1) : dateDaysFromNow(options.startOffsetDays));
   const endDate = addDays(startDate, options.daysAhead - 1);
   const automationDate = new Date().toISOString().slice(0, 10);
   const automationKey = `daily-smooth:${automationDate}:${property.key}:${startDate}:${endDate}`;
-  const notes = `daily-run ${automationDate}; property=${property.key}; window=${startDate}..${endDate}`;
+  const offsetNote = options.startOffsetDays === null ? "default-start=tomorrow" : `start-offset-days=${options.startOffsetDays}`;
+  const notes = `daily-run ${automationDate}; property=${property.key}; window=${startDate}..${endDate}; ${offsetNote}`;
 
   return withLock(`daily-${property.key}`, async () => {
     let run = options.forceNew ? null : await findExistingRun(automationKey);

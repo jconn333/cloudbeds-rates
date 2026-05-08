@@ -30,6 +30,14 @@ Follow-up unattended review rollout:
 
 Result: `cloudbeds-rates-daily.timer` is enabled and active, with the next plan-only run scheduled for `2026-05-08 05:17:31 EDT`. The effective service command is `npm run daily:plan`, not `daily:apply`; the app API still reports `writesEnabled: false`.
 
+Follow-up rollout direction adjustment:
+
+- [x] Add `DAILY_RUN_START_OFFSET_DAYS` / `--start-offset-days` so unattended runs can start far in the future.
+- [x] Document far-future-to-near-term rollout with `DAILY_RUN_START_OFFSET_DAYS=364` and `DAILY_RUN_DAYS_AHEAD=1`.
+- [x] Deploy the new plan-only offset settings to the VPS and verify the next planned date.
+
+Result: VPS `/etc/cloudbeds-rates.env` now has `DAILY_RUN_START_OFFSET_DAYS=364`, `DAILY_RUN_DAYS_AHEAD=1`, and `ENABLE_CLOUDBEDS_WRITES=false`. The timer remains enabled/active and plan-only via `plan-only.conf`. A VPS smoke plan for Berlin Resort created `run_20260508031245_78461538` for `2027-05-07` with 21 planned changes and 1 chunk, confirming the far-future one-night window.
+
 ## 2026-04-23 Progress bar for fetches and chunked runs
 
 - [x] Add a reusable operation progress bar near the status message.

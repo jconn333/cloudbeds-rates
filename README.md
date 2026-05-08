@@ -28,9 +28,20 @@ npm run daily:apply
 
 Live writes still require `ENABLE_CLOUDBEDS_WRITES=true`; the apply command alone
 is not enough. The daily runner uses `DAILY_RUN_PROPERTIES`,
-`DAILY_RUN_DAYS_AHEAD`, and `DAILY_RUN_OPERATOR` from the environment. It stores
-an automation key on each run, uses a per-property lock file, and refuses to
-apply paused or otherwise non-planned runs unattended.
+`DAILY_RUN_START_OFFSET_DAYS`, `DAILY_RUN_DAYS_AHEAD`, and
+`DAILY_RUN_OPERATOR` from the environment. It stores an automation key on each
+run, uses a per-property lock file, and refuses to apply paused or otherwise
+non-planned runs unattended.
+
+For lower-risk live rollout, work from far-future dates back toward near-term
+dates. For example, this plans one night roughly a year out; tomorrow's scheduled
+run naturally moves one day closer because the offset is recalculated from that
+day's date:
+
+```sh
+DAILY_RUN_START_OFFSET_DAYS=364
+DAILY_RUN_DAYS_AHEAD=1
+```
 
 For a DigitalOcean/systemd deployment, see
 `docs/digitalocean-vps-deploy.md`.
@@ -61,6 +72,11 @@ Keep `ENABLE_CLOUDBEDS_WRITES=false` while this drop-in is active. In this mode
 the timer can create/reuse planned runs every day, but it cannot write rates.
 Codex reviews the VPS status, timer logs, recent runs, verification state, and
 backup presence daily in the project thread.
+
+The preferred rollout direction is far-future to near-term. Use
+`DAILY_RUN_START_OFFSET_DAYS=364` with `DAILY_RUN_DAYS_AHEAD=1` to start about a
+year out and move one night closer on each daily run. This avoids testing first
+on dates closest to today's actual booking window.
 
 To inspect the UI from a local machine:
 
