@@ -53,6 +53,7 @@ DAILY_RUN_PROPERTIES=berlin-encore,berlin-resort
 DAILY_RUN_START_OFFSET_DAYS=364
 DAILY_RUN_DAYS_AHEAD=1
 DAILY_RUN_OPERATOR=digitalocean-daily
+DAILY_RUN_VERIFY_ROLLBACK_READINESS=true
 ENABLE_CLOUDBEDS_WRITES=false
 HOST=127.0.0.1
 PORT=3787
@@ -66,6 +67,10 @@ The recommended live rollout starts far in the future and works backward toward
 near-term dates. `DAILY_RUN_START_OFFSET_DAYS=364` plus `DAILY_RUN_DAYS_AHEAD=1`
 means each daily run covers one night about a year out; the next day's run moves
 one night closer to today.
+
+Keep `DAILY_RUN_VERIFY_ROLLBACK_READINESS=true` for live automation. After each
+successful apply, the runner creates a rollback plan from the new backup and
+fails the service if any rollback draft has conflicts.
 
 ## Install services
 

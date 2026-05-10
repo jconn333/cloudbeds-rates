@@ -38,6 +38,15 @@ Follow-up rollout direction adjustment:
 
 Result: VPS `/etc/cloudbeds-rates.env` now has `DAILY_RUN_START_OFFSET_DAYS=364`, `DAILY_RUN_DAYS_AHEAD=1`, and `ENABLE_CLOUDBEDS_WRITES=false`. The timer remains enabled/active and plan-only via `plan-only.conf`. A VPS smoke plan for Berlin Resort created `run_20260508031245_78461538` for `2027-05-07` with 21 planned changes and 1 chunk, confirming the far-future one-night window.
 
+Follow-up rollback readiness gate:
+
+- [x] Make `daily:apply` immediately generate a rollback plan after a successful apply.
+- [x] Fail/report the apply command if any generated rollback draft has conflicts.
+- [x] Keep the gate enabled by default through `DAILY_RUN_VERIFY_ROLLBACK_READINESS=true`.
+- [x] Deploy to the VPS and verify the timer remains plan-only before enabling live writes.
+
+Result: Deployed the rollback readiness gate to the VPS with `DAILY_RUN_VERIFY_ROLLBACK_READINESS=true`. VPS safety state remains `ENABLE_CLOUDBEDS_WRITES=false`, `DAILY_RUN_START_OFFSET_DAYS=364`, `DAILY_RUN_DAYS_AHEAD=1`, and the effective daily service command is still `npm run daily:plan` via `plan-only.conf`. A VPS plan-only smoke run reused `run_20260510091538_b0a288e9` for Berlin Resort `2027-05-09` without writes.
+
 ## 2026-04-23 Progress bar for fetches and chunked runs
 
 - [x] Add a reusable operation progress bar near the status message.

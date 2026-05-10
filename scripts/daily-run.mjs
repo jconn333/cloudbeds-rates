@@ -4,8 +4,10 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import {
   applyRun,
+  createRollbackRunFromRun,
   createRun,
   getDataDir,
+  getDraft,
   getRun,
   initializeStorage,
   listRuns,
@@ -24,6 +26,8 @@ Options:
   --days-ahead <n>       Inclusive night count. Defaults to DAILY_RUN_DAYS_AHEAD or 365.
   --operator <name>      Operator label for run/audit history. Defaults to daily-run.
   --apply                Apply the planned run. Also requires ENABLE_CLOUDBEDS_WRITES=true.
+  --skip-rollback-readiness
+                         Skip immediate rollback-plan validation after apply.
   --force-new            Create a new run even if today's automation key already exists.
   --help                 Show this help.
 `;
@@ -34,6 +38,7 @@ function parseArgs(argv) {
     apply: false,
     forceNew: false,
     operator: process.env.DAILY_RUN_OPERATOR ?? "daily-run",
+    verifyRollbackReadiness: String(process.env.DAILY_RUN_VERIFY_ROLLBACK_READINESS ?? "true").toLowerCase() !== "false",
     properties: [],
     startDate: process.env.DAILY_RUN_START_DATE ?? null,
     startOffsetDays:
@@ -55,6 +60,8 @@ function parseArgs(argv) {
       options.help = true;
     } else if (arg === "--apply") {
       options.apply = true;
+    } else if (arg === "--skip-rollback-readiness") {
+      options.verifyRollbackReadiness = false;
     } else if (arg === "--force-new") {
       options.forceNew = true;
     } else if (arg === "--property") {
@@ -152,6 +159,59 @@ function summarize(run) {
   return `${run.propertyName} ${run.startDate}..${run.endDate}: ${run.status}, ${run.totalChanges} change(s), ${run.chunkCount} chunk(s)`;
 }
 
+async function verifyRollbackReadiness(appliedRun, operator) {
+  if (appliedRun.status !== "applied") {
+    throw new Error(`Rollback readiness requires an applied run; ${appliedRun.id} is ${appliedRun.status}.`);
+  }
+  if (!appliedRun.totalChanges) {
+    return {
+      needed: false,
+      message: `Rollback readiness not needed for ${appliedRun.id}; no rates changed.`,
+    };
+  }
+
+  const rollbackRun = await createRollbackRunFromRun(appliedRun.id, `${operator}-rollback-readiness`);
+  let draftCount = 0;
+  let changeCount = 0;
+  let conflictCount = 0;
+  const conflictSamples = [];
+
+  for (const chunk of rollbackRun.chunks) {
+    if (!chunk.draftId || !chunk.backupId) {
+      throw new Error(`Rollback readiness failed for ${rollbackRun.id}; chunk ${chunk.sequence} is missing a draft or backup.`);
+    }
+    const draft = await getDraft(chunk.draftId);
+    draftCount += 1;
+    changeCount += draft.changes.length;
+    const conflicts = draft.changes.filter((change) => change.conflict);
+    conflictCount += conflicts.length;
+    for (const conflict of conflicts.slice(0, 3 - conflictSamples.length)) {
+      conflictSamples.push({
+        roomTypeName: conflict.roomTypeName,
+        date: conflict.date,
+        currentRate: conflict.currentRate,
+        expectedCurrentRate: conflict.expectedCurrentRate,
+        proposedRate: conflict.proposedRate,
+      });
+    }
+  }
+
+  if (conflictCount) {
+    throw new Error(
+      `Rollback readiness failed for ${appliedRun.id}; rollback run ${rollbackRun.id} has ${conflictCount} conflict(s). Samples: ${JSON.stringify(conflictSamples)}`
+    );
+  }
+
+  return {
+    needed: true,
+    rollbackRunId: rollbackRun.id,
+    draftCount,
+    changeCount,
+    conflictCount,
+    message: `Rollback readiness passed for ${appliedRun.id}; rollback run ${rollbackRun.id} has ${draftCount} draft(s), ${changeCount} change(s), and 0 conflicts.`,
+  };
+}
+
 async function findExistingRun(automationKey) {
   const runs = await listRuns();
   const existing = runs.find((run) => run.automationKey === automationKey);
@@ -199,7 +259,11 @@ async function runProperty(propertyKey, options) {
 
     const appliedRun = await applyRun(run.id);
     console.log(`Applied run ${appliedRun.id}: ${summarize(appliedRun)}.`);
-    return { run: appliedRun, applied: true };
+    const rollbackReadiness = options.verifyRollbackReadiness
+      ? await verifyRollbackReadiness(appliedRun, options.operator)
+      : { needed: false, message: `Rollback readiness skipped for ${appliedRun.id}.` };
+    console.log(rollbackReadiness.message);
+    return { run: appliedRun, applied: true, rollbackReadiness };
   });
 }
 
@@ -217,7 +281,10 @@ async function main() {
     results.push(await runProperty(propertyKey, options));
   }
 
-  const lines = results.map(({ run, applied }) => `${applied ? "APPLIED" : "PLANNED"} ${run.id}: ${summarize(run)}`);
+  const lines = results.map(({ run, applied, rollbackReadiness }) => {
+    const rollbackText = rollbackReadiness ? `; ${rollbackReadiness.message}` : "";
+    return `${applied ? "APPLIED" : "PLANNED"} ${run.id}: ${summarize(run)}${rollbackText}`;
+  });
   const message = `Cloudbeds daily run ${options.apply ? "apply" : "plan"} completed.\n${lines.join("\n")}`;
   console.log(message);
   await postNotification(message);

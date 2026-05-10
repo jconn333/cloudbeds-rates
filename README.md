@@ -33,6 +33,13 @@ is not enough. The daily runner uses `DAILY_RUN_PROPERTIES`,
 run, uses a per-property lock file, and refuses to apply paused or otherwise
 non-planned runs unattended.
 
+After every successful `daily:apply`, the runner immediately creates a rollback
+plan from the new per-write backup and checks every rollback draft for conflicts.
+If rollback readiness fails, the command exits nonzero so systemd/journald and
+the Codex review loop surface it. This can be disabled only by setting
+`DAILY_RUN_VERIFY_ROLLBACK_READINESS=false` or passing
+`--skip-rollback-readiness`.
+
 For lower-risk live rollout, work from far-future dates back toward near-term
 dates. For example, this plans one night roughly a year out; tomorrow's scheduled
 run naturally moves one day closer because the offset is recalculated from that
@@ -99,6 +106,7 @@ Live writes require all of these to be true:
 - the target run is still `planned`
 - the run passes pre-apply live drift checks
 - Cloudbeds readback and adjacent-night verification pass after apply
+- an immediate rollback plan is generated from the new backup with 0 conflicts
 
 The app can switch between configured Cloudbeds properties. Keep the legacy
 `CLOUDBEDS_API_KEY` / `CLOUDBEDS_PROPERTY_ID` values for the default property,
