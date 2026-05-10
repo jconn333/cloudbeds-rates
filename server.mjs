@@ -34,6 +34,7 @@ const MAX_ALLOWED_RATE = Number(process.env.MAX_ALLOWED_RATE ?? "999.99");
 const MAX_SMOOTH_RATE_DECREASE = Number(process.env.MAX_SMOOTH_RATE_DECREASE ?? "0.99");
 const VERIFY_RETRY_ATTEMPTS = Number(process.env.VERIFY_RETRY_ATTEMPTS ?? "4");
 const VERIFY_RETRY_DELAY_MS = Number(process.env.VERIFY_RETRY_DELAY_MS ?? "3000");
+const APPLY_LOCK_STALE_MINUTES = Number(process.env.APPLY_LOCK_STALE_MINUTES ?? "240");
 const SAFETY_METADATA = {
   writeIntervalMode: "same_day",
   verificationMode: "targeted_scope_adjacent",
@@ -439,6 +440,39 @@ async function writeJson(filePath, data) {
 
 async function readJson(filePath) {
   return JSON.parse(await fs.readFile(filePath, "utf8"));
+}
+
+function lockSafeName(value) {
+  return String(value ?? "global").replace(/[^a-zA-Z0-9_.-]+/g, "-");
+}
+
+async function withDataLock(name, fn) {
+  await ensureDataDirs();
+  const lockFile = path.join(LOCKS_DIR, `${lockSafeName(name)}.lock`);
+
+  try {
+    const stat = await fs.stat(lockFile);
+    const ageMinutes = (Date.now() - stat.mtimeMs) / 60000;
+    if (ageMinutes > APPLY_LOCK_STALE_MINUTES) await fs.unlink(lockFile);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+
+  let handle;
+  try {
+    handle = await fs.open(lockFile, "wx");
+    await handle.writeFile(`${process.pid}\n${new Date().toISOString()}\n${name}\n`);
+  } catch (error) {
+    if (error.code === "EEXIST") throw new Error(`Another Cloudbeds apply is already active (${lockFile}).`);
+    throw error;
+  }
+
+  try {
+    return await fn();
+  } finally {
+    await handle?.close();
+    await fs.unlink(lockFile).catch(() => {});
+  }
 }
 
 async function cloudbeds(method, params = {}, init = {}, propertyContext = resolveDefaultProperty()) {
@@ -865,7 +899,9 @@ function chunkChangesForRun(changes) {
 function summarizeRun(run) {
   const appliedChunks = run.chunks.filter((chunk) => chunk.status === "applied").length;
   const skippedChunks = run.chunks.filter((chunk) => chunk.status === "skipped").length;
-  const failedChunks = run.chunks.filter((chunk) => chunk.status === "verification_failed" || chunk.status === "apply_failed").length;
+  const failedChunks = run.chunks.filter((chunk) =>
+    ["verification_failed", "apply_failed", "partial_apply_failed"].includes(chunk.status)
+  ).length;
   const totalVerified = run.chunks.reduce((sum, chunk) => sum + (chunk.verifiedCount ?? 0), 0);
   return {
     id: run.id,
@@ -874,6 +910,7 @@ function summarizeRun(run) {
     propertyId: run.propertyId,
     propertyName: run.propertyName,
     automationKey: run.automationKey ?? null,
+    readinessOnly: Boolean(run.readinessOnly),
     startDate: run.startDate,
     endDate: run.endDate,
     createdAt: run.createdAt,
@@ -1086,7 +1123,7 @@ async function createRollbackDraftFromBackup(id, operator = "local") {
   return draft;
 }
 
-async function createRollbackRunFromRun(id, operator = "web-app") {
+async function createRollbackRunFromRun(id, operator = "web-app", options = {}) {
   const sourceRun = await getRun(id);
   const appliedChunks = sourceRun.chunks.filter((chunk) => chunk.backupId);
   if (!appliedChunks.length) throw new Error("Run has no backups to roll back.");
@@ -1120,7 +1157,10 @@ async function createRollbackRunFromRun(id, operator = "web-app") {
     startDate: sourceRun.startDate,
     endDate: sourceRun.endDate,
     operator,
-    notes: `Rollback plan for ${sourceRun.id}`,
+    notes: options.readinessOnly
+      ? `Rollback readiness check for ${sourceRun.id}`
+      : `Rollback plan for ${sourceRun.id}`,
+    readinessOnly: Boolean(options.readinessOnly),
     createdAt: isoNow(),
     status: "planned",
     totalChanges: rollbackChunks.reduce((sum, chunk) => sum + chunk.changeCount, 0),
@@ -1146,7 +1186,12 @@ async function createRollbackRunFromRun(id, operator = "web-app") {
     propertyId: rollbackRun.propertyId,
     startDate: rollbackRun.startDate,
     endDate: rollbackRun.endDate,
-    payload: { sourceRunId: sourceRun.id, chunkCount: rollbackRun.chunkCount, totalChanges: rollbackRun.totalChanges },
+    payload: {
+      sourceRunId: sourceRun.id,
+      chunkCount: rollbackRun.chunkCount,
+      totalChanges: rollbackRun.totalChanges,
+      readinessOnly: rollbackRun.readinessOnly,
+    },
   });
   return rollbackRun;
 }
@@ -1360,12 +1405,19 @@ async function verifyDraftIntegrity(draft, backup, propertyContext = resolveDefa
   return { targetedVerification, scopeVerification, adjacentVerification, summary };
 }
 
-async function applyDraft(id, confirmation) {
+async function applyDraft(id, confirmation, options = {}) {
+  if (!options.skipLock) {
+    const draftForLock = await getDraft(id);
+    const propertyForLock = resolveProperty(draftForLock.propertyKey ?? draftForLock.propertyId);
+    return withDataLock(`apply-${propertyForLock.key}`, () => applyDraft(id, confirmation, { ...options, skipLock: true }));
+  }
+
   const draft = await getDraft(id);
   const backup = await getBackup(draft.backupId);
   const property = resolveProperty(draft.propertyKey ?? draft.propertyId);
   if (!WRITES_ENABLED) throw new Error("Writes are disabled. Set ENABLE_CLOUDBEDS_WRITES=true to apply drafts.");
   if (draft.status === "applied") throw new Error("Draft has already been applied.");
+  if (draft.status !== "draft") throw new Error(`Draft is ${draft.status}; create a fresh draft before applying.`);
   if (confirmation !== "yes") throw new Error("Apply confirmation is required.");
   if (draft.changes.length > MAX_APPLY_CHANGES) {
     throw new Error(`Draft has ${draft.changes.length} changes; current apply limit is ${MAX_APPLY_CHANGES}.`);
@@ -1406,41 +1458,138 @@ async function applyDraft(id, confirmation) {
   });
 
   const jobs = [];
-  for (const change of draft.changes) {
-    const response = await cloudbeds(
-      "putRate",
-      {
-        "rates[0][rateID]": change.rateID,
-        "rates[0][interval][0][startDate]": change.startDate,
-        "rates[0][interval][0][endDate]": cloudbedsWriteEndDate(change),
-        "rates[0][interval][0][rate]": change.proposedRate.toFixed(2),
-      },
-      { method: "POST" },
-      property
-    );
-    jobs.push({ rateID: change.rateID, proposedRate: change.proposedRate, jobReferenceID: response.jobReferenceID });
-  }
+  const pollErrors = [];
+  let writeError = null;
+  let verificationResult = null;
 
-  const completedJobs = [];
-  for (const job of jobs) {
-    completedJobs.push({ ...job, cloudbedsJob: await pollJob(job.jobReferenceID, property) });
-  }
-
-  const verificationResult = await verifyDraftIntegrity(draft, backup, property);
-  const verification = verificationResult.targetedVerification;
-
-  const applied = {
-    ...draft,
-    safetyMetadata: backup.safetyMetadata ?? SAFETY_METADATA,
-    status: verificationResult.summary.allVerified ? "applied" : "verification_failed",
-    appliedAt: isoNow(),
-    jobs: completedJobs,
-    verification,
-    scopeVerification: verificationResult.scopeVerification,
-    adjacentVerification: verificationResult.adjacentVerification,
-    verificationSummary: verificationResult.summary,
+  const persistDraftState = async (status, extra = {}) => {
+    const record = {
+      ...draft,
+      safetyMetadata: backup.safetyMetadata ?? SAFETY_METADATA,
+      status,
+      jobs,
+      verification: extra.verification ?? [],
+      scopeVerification: extra.scopeVerification ?? [],
+      adjacentVerification: extra.adjacentVerification ?? [],
+      verificationSummary: extra.verificationSummary ?? null,
+      ...(extra.appliedAt ? { appliedAt: extra.appliedAt } : {}),
+      ...(extra.error ? { error: extra.error } : {}),
+      ...(extra.partialApply ? { partialApply: extra.partialApply } : {}),
+      ...(extra.writeError ? { writeError: extra.writeError } : {}),
+      ...(extra.pollErrors ? { pollErrors: extra.pollErrors } : {}),
+    };
+    await writeJson(path.join(DRAFTS_DIR, `${id}.json`), record);
+    return record;
   };
-  await writeJson(path.join(DRAFTS_DIR, `${id}.json`), applied);
+
+  await persistDraftState("applying", { appliedAt: draft.appliedAt ?? null });
+
+  for (const change of draft.changes) {
+    try {
+      const response = await cloudbeds(
+        "putRate",
+        {
+          "rates[0][rateID]": change.rateID,
+          "rates[0][interval][0][startDate]": change.startDate,
+          "rates[0][interval][0][endDate]": cloudbedsWriteEndDate(change),
+          "rates[0][interval][0][rate]": change.proposedRate.toFixed(2),
+        },
+        { method: "POST" },
+        property
+      );
+      if (!response.jobReferenceID) throw new Error("Cloudbeds putRate did not return a jobReferenceID.");
+      jobs.push({
+        rateID: change.rateID,
+        roomTypeName: change.roomTypeName,
+        date: change.date,
+        proposedRate: change.proposedRate,
+        jobReferenceID: response.jobReferenceID,
+      });
+      await persistDraftState("applying", {
+        appliedAt: draft.appliedAt ?? null,
+        partialApply: { submittedJobs: jobs.length, expectedJobs: draft.changes.length },
+      });
+    } catch (error) {
+      writeError = error;
+      break;
+    }
+  }
+
+  const submittedJobs = [...jobs];
+  const completedJobs = [];
+  for (const job of submittedJobs) {
+    try {
+      completedJobs.push({ ...job, cloudbedsJob: await pollJob(job.jobReferenceID, property) });
+    } catch (error) {
+      pollErrors.push({ ...job, error: error.message });
+      completedJobs.push({ ...job, cloudbedsJob: { jobReferenceID: job.jobReferenceID, status: "poll_failed" }, error: error.message });
+    }
+    jobs.splice(0, jobs.length, ...completedJobs);
+    await persistDraftState(writeError || pollErrors.length ? "partial_apply_failed" : "applying", {
+      appliedAt: isoNow(),
+      partialApply: {
+        submittedJobs: completedJobs.length,
+        expectedJobs: draft.changes.length,
+        writeError: writeError?.message ?? null,
+        pollErrorCount: pollErrors.length,
+      },
+      ...(writeError ? { writeError: writeError.message } : {}),
+      ...(pollErrors.length ? { pollErrors } : {}),
+    });
+  }
+
+  jobs.splice(0, jobs.length, ...completedJobs);
+  if (submittedJobs.length) {
+    verificationResult = await verifyDraftIntegrity(draft, backup, property);
+  } else {
+    verificationResult = {
+      targetedVerification: [],
+      scopeVerification: [],
+      adjacentVerification: [],
+      summary: {
+        targetedCount: draft.changes.length,
+        targetedVerifiedCount: 0,
+        untouchedScopeCount: 0,
+        untouchedScopeVerifiedCount: 0,
+        adjacentCount: 0,
+        adjacentVerifiedCount: 0,
+        adjacentSuspiciousCount: 0,
+        allVerified: false,
+      },
+    };
+  }
+  const verification = verificationResult.targetedVerification;
+  const hasOperationalError = Boolean(writeError) || pollErrors.length > 0;
+  const status =
+    verificationResult.summary.allVerified && !hasOperationalError
+      ? "applied"
+      : submittedJobs.length
+        ? hasOperationalError
+          ? "partial_apply_failed"
+          : "verification_failed"
+        : "apply_failed";
+
+  const applied = await persistDraftState(status, {
+    appliedAt: isoNow(),
+    verification,
+    scopeVerification: verificationResult.scopeVerification ?? [],
+    adjacentVerification: verificationResult.adjacentVerification ?? [],
+    verificationSummary: verificationResult.summary,
+    ...(status !== "applied" ? { error: writeError?.message ?? describeVerificationFailure(verificationResult.summary) } : {}),
+    ...(status !== "applied"
+      ? {
+          partialApply: {
+            submittedJobs: completedJobs.length,
+            expectedJobs: draft.changes.length,
+            writeError: writeError?.message ?? null,
+            pollErrorCount: pollErrors.length,
+            allVerified: verificationResult.summary.allVerified,
+          },
+        }
+      : {}),
+    ...(writeError ? { writeError: writeError.message } : {}),
+    ...(pollErrors.length ? { pollErrors } : {}),
+  });
   auditEvent({
     type: "draft_apply_finished",
     operator: draft.operator,
@@ -1459,8 +1608,14 @@ async function applyDraft(id, confirmation) {
       adjacentVerifiedCount: verificationResult.summary.adjacentVerifiedCount,
       adjacentCount: verificationResult.summary.adjacentCount,
       adjacentSuspiciousCount: verificationResult.summary.adjacentSuspiciousCount,
+      submittedJobs: completedJobs.length,
+      writeError: writeError?.message ?? null,
+      pollErrorCount: pollErrors.length,
     },
   });
+  if (status === "apply_failed") {
+    throw new Error(writeError?.message ?? "No Cloudbeds write jobs were submitted.");
+  }
   return applied;
 }
 
@@ -1556,6 +1711,37 @@ function finalizeRunStatus(run) {
   });
 }
 
+async function refreshChunkFromDraft(run, chunk) {
+  if (!chunk.draftId) return false;
+  let draft;
+  try {
+    draft = await getDraft(chunk.draftId);
+  } catch {
+    return false;
+  }
+  if (!["applied", "verification_failed", "partial_apply_failed", "apply_failed"].includes(draft.status)) return false;
+
+  chunk.status = draft.status;
+  chunk.appliedAt = draft.appliedAt ?? chunk.appliedAt ?? null;
+  chunk.verifiedCount = (draft.verification ?? []).filter((item) => item.verified).length;
+  chunk.error =
+    draft.status === "applied"
+      ? null
+      : draft.error ?? describeVerificationFailure(draft.verificationSummary ?? {});
+  if (draft.partialApply) chunk.partialApply = draft.partialApply;
+  updateRunProgress(run, {
+    phase: draft.status === "applied" ? "running" : "paused",
+    activeChunkSequence: null,
+    failedChunkSequence: draft.status === "applied" ? null : chunk.sequence,
+    message:
+      draft.status === "applied"
+        ? `Recovered chunk ${chunk.sequence} from saved draft ${draft.id}; it verified ${chunk.verifiedCount}/${draft.changes.length} row(s).`
+        : `Recovered chunk ${chunk.sequence} from saved draft ${draft.id}; status is ${draft.status}.`,
+  });
+  await saveRun(run);
+  return true;
+}
+
 function findLiveRow(rows, change) {
   return rows.find((row) => row.rateID === change.rateID && row.date === change.date);
 }
@@ -1627,12 +1813,20 @@ async function assessChunkLiveState(run, chunk) {
 
 async function applyRun(id, options = {}) {
   await initializeStorage();
+  if (!options.skipLock) {
+    const runForLock = await getRun(id);
+    const propertyForLock = resolveProperty(runForLock.propertyKey ?? runForLock.propertyId);
+    return withDataLock(`apply-${propertyForLock.key}`, () => applyRun(id, { ...options, skipLock: true }));
+  }
+
   const run = await getRun(id);
   resolveProperty(run.propertyKey ?? run.propertyId);
   if (!WRITES_ENABLED) throw new Error("Writes are disabled. Set ENABLE_CLOUDBEDS_WRITES=true to apply runs.");
   if (run.status === "applied") throw new Error("Run has already been applied.");
   const mode = options.mode === "retry_failed_chunk" ? "retry_failed_chunk" : "resume";
-  const failedChunk = run.chunks.find((chunk) => chunk.status === "verification_failed" || chunk.status === "apply_failed");
+  const failedChunk = run.chunks.find((chunk) =>
+    ["verification_failed", "apply_failed", "partial_apply_failed"].includes(chunk.status)
+  );
   const targetChunkSequence = mode === "retry_failed_chunk" ? failedChunk?.sequence ?? null : null;
   if (mode === "retry_failed_chunk" && !targetChunkSequence) {
     throw new Error("Run has no failed chunk to retry.");
@@ -1660,6 +1854,15 @@ async function applyRun(id, options = {}) {
   for (const chunk of run.chunks) {
     if (targetChunkSequence && chunk.sequence !== targetChunkSequence) continue;
     if (chunk.status === "applied") continue;
+    if (["running", "draft_created"].includes(chunk.status)) {
+      const refreshed = await refreshChunkFromDraft(run, chunk);
+      if (refreshed && chunk.status === "applied") continue;
+      if (!refreshed) {
+        throw new Error(
+          `Chunk ${chunk.sequence} is ${chunk.status}; review the saved draft/job state before resuming to avoid duplicate writes.`
+        );
+      }
+    }
     try {
       chunk.error = null;
       updateRunProgress(run, {
@@ -1815,12 +2018,20 @@ async function applyRun(id, options = {}) {
         },
       });
 
-      const applied = await applyDraft(draft.id, "yes");
+      const applied = await applyDraft(draft.id, "yes", { skipLock: true });
       chunk.status = applied.status;
       chunk.appliedAt = applied.appliedAt;
       chunk.verifiedCount = applied.verification.filter((item) => item.verified).length;
       chunk.backupId = chunk.backupId ?? applied.backupId;
-      chunk.error = applied.status === "applied" ? null : describeVerificationFailure(applied.verificationSummary ?? {});
+      chunk.error =
+        applied.status === "applied"
+          ? null
+          : applied.error ?? describeVerificationFailure(applied.verificationSummary ?? {});
+      if (applied.status !== "applied" && applied.partialApply) {
+        chunk.partialApply = applied.partialApply;
+      } else {
+        delete chunk.partialApply;
+      }
       updateRunProgress(run, {
         phase: applied.status === "applied" ? "running" : "paused",
         activeChunkSequence: null,

@@ -158,7 +158,8 @@ function summarizeRunEvent(event) {
 }
 
 function runPrimaryAction(run, failedChunks, appliedChunks) {
-  const resumable = ["planned", "running", "paused", "verification_failed", "apply_failed"].includes(run.status);
+  if (run.readinessOnly) return null;
+  const resumable = ["planned", "running", "paused", "verification_failed", "apply_failed", "partial_apply_failed"].includes(run.status);
   if (!resumable) return null;
   const hasProgress = appliedChunks > 0 || failedChunks > 0 || run.status === "paused";
   if (run.type === "rollback") {
@@ -483,7 +484,7 @@ function renderRunList(runs) {
       (run) => `
         <button class="draft-item run-item" data-run-id="${run.id}" type="button">
           <strong>${escapeHtml(run.propertyName ?? "")} · ${run.startDate} to ${run.endDate}</strong>
-          <span>${run.totalChanges} changes · ${run.chunkCount} chunks · ${run.status}</span>
+          <span>${run.totalChanges} changes · ${run.chunkCount} chunks · ${run.status}${run.readinessOnly ? " · readiness check" : ""}</span>
           <span>${run.id}</span>
         </button>
       `
@@ -522,7 +523,9 @@ function renderRunDetail(run) {
   $("selectedRunState").textContent = `${run.status} · ${run.id}`;
   const appliedChunks = run.chunks.filter((chunk) => chunk.status === "applied").length;
   const skippedChunks = run.chunks.filter((chunk) => chunk.status === "skipped").length;
-  const failedChunks = run.chunks.filter((chunk) => chunk.status === "verification_failed" || chunk.status === "apply_failed").length;
+  const failedChunks = run.chunks.filter((chunk) =>
+    ["verification_failed", "apply_failed", "partial_apply_failed"].includes(chunk.status)
+  ).length;
   const spillSuspectedChunks = run.chunks.filter((chunk) => chunk.driftSummary?.category === "adjacent_spill_suspected").length;
   const totalVerified = run.chunks.reduce((sum, chunk) => sum + (chunk.verifiedCount ?? 0), 0);
   const progress = run.progress ?? {};
@@ -600,6 +603,11 @@ function renderRunDetail(run) {
                 : ""
             }
             ${
+              chunk.partialApply
+                ? `<div class="chunk-note">${escapeHtml(`${chunk.partialApply.submittedJobs}/${chunk.partialApply.expectedJobs} Cloudbeds job(s) submitted before reconciliation.`)}</div>`
+                : ""
+            }
+            ${
               chunk.appliedAt
                 ? `<div class="chunk-note">Finished ${escapeHtml(formatDateTime(chunk.appliedAt))} · verified ${chunk.verifiedCount ?? 0}/${chunk.changeCount}</div>`
                 : ""
@@ -610,10 +618,10 @@ function renderRunDetail(run) {
     )
     .join("");
 
-  const resumable = ["planned", "running", "paused", "verification_failed", "apply_failed"].includes(run.status);
-  const canRollback = run.type === "smooth" && appliedChunks > 0;
+  const resumable = ["planned", "running", "paused", "verification_failed", "apply_failed", "partial_apply_failed"].includes(run.status);
+  const canRollback = !run.readinessOnly && run.type === "smooth" && appliedChunks > 0;
   const primaryAction = runPrimaryAction(run, failedChunks, appliedChunks);
-  const canRetryFailedChunk = failedChunks > 0 && state.config.writesEnabled;
+  const canRetryFailedChunk = !run.readinessOnly && failedChunks > 0 && state.config.writesEnabled;
   $("runDetail").className = "draft-detail";
   $("runDetail").innerHTML = `
     <div class="summary-grid">

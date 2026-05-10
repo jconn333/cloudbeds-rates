@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 import "dotenv/config";
+import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { promisify } from "node:util";
 import {
   applyRun,
+  createRateBackup,
   createRollbackRunFromRun,
   createRun,
   getDataDir,
@@ -13,6 +16,8 @@ import {
   listRuns,
   resolveProperty,
 } from "../server.mjs";
+
+const execFileAsync = promisify(execFile);
 
 function usage() {
   return `Usage:
@@ -24,8 +29,12 @@ Options:
   --start-offset-days <n>
                          First inclusive night as n days from today's UTC date.
   --days-ahead <n>       Inclusive night count. Defaults to DAILY_RUN_DAYS_AHEAD or 365.
+  --end-date-limit <date>
+                         Last inclusive night the daily runner may touch.
   --operator <name>      Operator label for run/audit history. Defaults to daily-run.
   --apply                Apply the planned run. Also requires ENABLE_CLOUDBEDS_WRITES=true.
+  --skip-pre-apply-backup
+                         Skip the full-scope backup created immediately before apply.
   --skip-rollback-readiness
                          Skip immediate rollback-plan validation after apply.
   --force-new            Create a new run even if today's automation key already exists.
@@ -39,6 +48,7 @@ function parseArgs(argv) {
     forceNew: false,
     operator: process.env.DAILY_RUN_OPERATOR ?? "daily-run",
     verifyRollbackReadiness: String(process.env.DAILY_RUN_VERIFY_ROLLBACK_READINESS ?? "true").toLowerCase() !== "false",
+    preApplyBackup: String(process.env.DAILY_RUN_PRE_APPLY_BACKUP ?? "true").toLowerCase() !== "false",
     properties: [],
     startDate: process.env.DAILY_RUN_START_DATE ?? null,
     startOffsetDays:
@@ -46,6 +56,7 @@ function parseArgs(argv) {
         ? null
         : Number(process.env.DAILY_RUN_START_OFFSET_DAYS),
     daysAhead: Number(process.env.DAILY_RUN_DAYS_AHEAD ?? "365"),
+    endDateLimit: process.env.DAILY_RUN_END_DATE_LIMIT ?? null,
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -62,6 +73,8 @@ function parseArgs(argv) {
       options.apply = true;
     } else if (arg === "--skip-rollback-readiness") {
       options.verifyRollbackReadiness = false;
+    } else if (arg === "--skip-pre-apply-backup") {
+      options.preApplyBackup = false;
     } else if (arg === "--force-new") {
       options.forceNew = true;
     } else if (arg === "--property") {
@@ -72,6 +85,8 @@ function parseArgs(argv) {
       options.startOffsetDays = Number(next());
     } else if (arg === "--days-ahead") {
       options.daysAhead = Number(next());
+    } else if (arg === "--end-date-limit") {
+      options.endDateLimit = next();
     } else if (arg === "--operator") {
       options.operator = next();
     } else {
@@ -96,8 +111,15 @@ function parseArgs(argv) {
   ) {
     throw new Error("--start-offset-days must be a non-negative integer.");
   }
+  if (options.endDateLimit && !isIsoDate(options.endDateLimit)) {
+    throw new Error("--end-date-limit must be YYYY-MM-DD.");
+  }
 
   return options;
+}
+
+function isIsoDate(value) {
+  return /^\d{4}-\d{2}-\d{2}$/.test(String(value ?? ""));
 }
 
 function dateDaysFromNow(days) {
@@ -155,6 +177,27 @@ async function postNotification(text) {
   }
 }
 
+async function runBackupSync(stage, context = {}) {
+  const command = process.env.DAILY_RUN_BACKUP_SYNC_COMMAND;
+  if (!command) return;
+
+  const env = {
+    ...process.env,
+    DAILY_RUN_SYNC_STAGE: stage,
+    DAILY_RUN_SYNC_PROPERTY: context.propertyKey ?? "",
+    DAILY_RUN_SYNC_RUN_ID: context.runId ?? "",
+    DAILY_RUN_SYNC_BACKUP_ID: context.backupId ?? "",
+    DAILY_RUN_SYNC_START_DATE: context.startDate ?? "",
+    DAILY_RUN_SYNC_END_DATE: context.endDate ?? "",
+  };
+  await execFileAsync("/bin/sh", ["-lc", command], {
+    cwd: process.cwd(),
+    env,
+    maxBuffer: 1024 * 1024 * 10,
+  });
+  console.log(`Backup sync command completed for ${stage}.`);
+}
+
 function summarize(run) {
   return `${run.propertyName} ${run.startDate}..${run.endDate}: ${run.status}, ${run.totalChanges} change(s), ${run.chunkCount} chunk(s)`;
 }
@@ -170,7 +213,9 @@ async function verifyRollbackReadiness(appliedRun, operator) {
     };
   }
 
-  const rollbackRun = await createRollbackRunFromRun(appliedRun.id, `${operator}-rollback-readiness`);
+  const rollbackRun = await createRollbackRunFromRun(appliedRun.id, `${operator}-rollback-readiness`, {
+    readinessOnly: true,
+  });
   let draftCount = 0;
   let changeCount = 0;
   let conflictCount = 0;
@@ -212,6 +257,26 @@ async function verifyRollbackReadiness(appliedRun, operator) {
   };
 }
 
+async function createPreApplyBackup(property, startDate, endDate, operator, automationKey) {
+  const backup = await createRateBackup({
+    propertyKey: property.key,
+    startDate,
+    endDate,
+    operator: `${operator}-pre-apply-backup`,
+    notes: `pre-apply backup for ${automationKey}`,
+  });
+  console.log(
+    `Created pre-apply backup ${backup.id}: ${backup.propertyName} ${backup.startDate}..${backup.endDate}; ${backup.baseRowsSnapshot.length} base row(s).`
+  );
+  await runBackupSync("pre-apply-backup", {
+    propertyKey: property.key,
+    backupId: backup.id,
+    startDate,
+    endDate,
+  });
+  return backup;
+}
+
 async function findExistingRun(automationKey) {
   const runs = await listRuns();
   const existing = runs.find((run) => run.automationKey === automationKey);
@@ -223,11 +288,20 @@ async function runProperty(propertyKey, options) {
   const startDate =
     options.startDate ??
     (options.startOffsetDays === null ? dateDaysFromNow(1) : dateDaysFromNow(options.startOffsetDays));
-  const endDate = addDays(startDate, options.daysAhead - 1);
+  let endDate = addDays(startDate, options.daysAhead - 1);
+  if (options.endDateLimit && startDate > options.endDateLimit) {
+    const message = `Skipping ${property.propertyName}; ${startDate} is after end-date limit ${options.endDateLimit}.`;
+    console.log(message);
+    return { skipped: true, message, applied: false };
+  }
+  if (options.endDateLimit && endDate > options.endDateLimit) {
+    endDate = options.endDateLimit;
+  }
   const automationDate = new Date().toISOString().slice(0, 10);
   const automationKey = `daily-smooth:${automationDate}:${property.key}:${startDate}:${endDate}`;
   const offsetNote = options.startOffsetDays === null ? "default-start=tomorrow" : `start-offset-days=${options.startOffsetDays}`;
-  const notes = `daily-run ${automationDate}; property=${property.key}; window=${startDate}..${endDate}; ${offsetNote}`;
+  const limitNote = options.endDateLimit ? `; end-date-limit=${options.endDateLimit}` : "";
+  const notes = `daily-run ${automationDate}; property=${property.key}; window=${startDate}..${endDate}; ${offsetNote}${limitNote}`;
 
   return withLock(`daily-${property.key}`, async () => {
     let run = options.forceNew ? null : await findExistingRun(automationKey);
@@ -257,13 +331,23 @@ async function runProperty(propertyKey, options) {
       throw new Error(`Run ${run.id} is ${run.status}; refusing unattended apply.`);
     }
 
+    const preApplyBackup = options.preApplyBackup
+      ? await createPreApplyBackup(property, startDate, endDate, options.operator, automationKey)
+      : null;
     const appliedRun = await applyRun(run.id);
     console.log(`Applied run ${appliedRun.id}: ${summarize(appliedRun)}.`);
     const rollbackReadiness = options.verifyRollbackReadiness
       ? await verifyRollbackReadiness(appliedRun, options.operator)
       : { needed: false, message: `Rollback readiness skipped for ${appliedRun.id}.` };
     console.log(rollbackReadiness.message);
-    return { run: appliedRun, applied: true, rollbackReadiness };
+    await runBackupSync("post-rollback-readiness", {
+      propertyKey: property.key,
+      runId: appliedRun.id,
+      backupId: preApplyBackup?.id ?? "",
+      startDate,
+      endDate,
+    });
+    return { run: appliedRun, applied: true, rollbackReadiness, preApplyBackup };
   });
 }
 
@@ -281,13 +365,17 @@ async function main() {
     results.push(await runProperty(propertyKey, options));
   }
 
-  const lines = results.map(({ run, applied, rollbackReadiness }) => {
+  const lines = results.map(({ run, applied, rollbackReadiness, preApplyBackup, skipped, message }) => {
+    if (skipped) return `SKIPPED: ${message}`;
+    const backupText = preApplyBackup ? `; pre-apply backup ${preApplyBackup.id}` : "";
     const rollbackText = rollbackReadiness ? `; ${rollbackReadiness.message}` : "";
-    return `${applied ? "APPLIED" : "PLANNED"} ${run.id}: ${summarize(run)}${rollbackText}`;
+    return `${applied ? "APPLIED" : "PLANNED"} ${run.id}: ${summarize(run)}${backupText}${rollbackText}`;
   });
   const message = `Cloudbeds daily run ${options.apply ? "apply" : "plan"} completed.\n${lines.join("\n")}`;
   console.log(message);
-  await postNotification(message);
+  await postNotification(message).catch((error) => {
+    console.error(`Notification failed after successful daily run: ${error.message}`);
+  });
 }
 
 main().catch(async (error) => {

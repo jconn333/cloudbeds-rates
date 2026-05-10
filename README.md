@@ -33,12 +33,20 @@ is not enough. The daily runner uses `DAILY_RUN_PROPERTIES`,
 run, uses a per-property lock file, and refuses to apply paused or otherwise
 non-planned runs unattended.
 
-After every successful `daily:apply`, the runner immediately creates a rollback
-plan from the new per-write backup and checks every rollback draft for conflicts.
-If rollback readiness fails, the command exits nonzero so systemd/journald and
-the Codex review loop surface it. This can be disabled only by setting
-`DAILY_RUN_VERIFY_ROLLBACK_READINESS=false` or passing
+Before every live `daily:apply`, the runner creates a full-scope pre-apply backup
+for the property/window unless `DAILY_RUN_PRE_APPLY_BACKUP=false` or
+`--skip-pre-apply-backup` is used. After every successful apply, it immediately
+creates a rollback-readiness plan from the new per-write backups and checks every
+rollback draft for conflicts. If rollback readiness fails, the command exits
+nonzero so systemd/journald and the Codex review loop surface it. This can be
+disabled only by setting `DAILY_RUN_VERIFY_ROLLBACK_READINESS=false` or passing
 `--skip-rollback-readiness`.
+
+Set `DAILY_RUN_BACKUP_SYNC_COMMAND` to run an off-box backup sync after the
+pre-apply backup and after rollback-readiness planning. The command receives
+`DAILY_RUN_SYNC_STAGE`, `DAILY_RUN_SYNC_PROPERTY`,
+`DAILY_RUN_SYNC_RUN_ID`, `DAILY_RUN_SYNC_BACKUP_ID`,
+`DAILY_RUN_SYNC_START_DATE`, and `DAILY_RUN_SYNC_END_DATE`.
 
 For lower-risk live rollout, work from far-future dates back toward near-term
 dates. For example, this plans one night roughly a year out; tomorrow's scheduled
@@ -66,19 +74,10 @@ There are two systemd surfaces:
 - `cloudbeds-rates.service` runs the local-only web UI on `127.0.0.1:3787`.
 - `cloudbeds-rates-daily.timer` schedules `cloudbeds-rates-daily.service`.
 
-The current rollout mode is unattended dry-run observation. The daily service has
-a systemd drop-in at
-`/etc/systemd/system/cloudbeds-rates-daily.service.d/plan-only.conf` that replaces
-the base `daily:apply` command with:
-
-```sh
-npm run daily:plan
-```
-
-Keep `ENABLE_CLOUDBEDS_WRITES=false` while this drop-in is active. In this mode
-the timer can create/reuse planned runs every day, but it cannot write rates.
-Codex reviews the VPS status, timer logs, recent runs, verification state, and
-backup presence daily in the project thread.
+The current rollout mode is controlled live timer testing against far-future 2027
+dates. Keep the web UI local-only and review timer logs, recent runs,
+verification state, pre-apply backups, per-chunk backups, and rollback-readiness
+runs after each live window change.
 
 The preferred rollout direction is far-future to near-term. Use
 `DAILY_RUN_START_OFFSET_DAYS=364` with `DAILY_RUN_DAYS_AHEAD=1` to start about a
@@ -104,6 +103,7 @@ Live writes require all of these to be true:
 - `ENABLE_CLOUDBEDS_WRITES=true`
 - the command is `npm run daily:apply`
 - the target run is still `planned`
+- the daily runner creates a full-scope pre-apply backup
 - the run passes pre-apply live drift checks
 - Cloudbeds readback and adjacent-night verification pass after apply
 - an immediate rollback plan is generated from the new backup with 0 conflicts
@@ -119,6 +119,8 @@ and add named aliases such as `CLOUDBEDS_BERLIN_ENCORE_*` and
 - Creating a draft only reads Cloudbeds and writes local backup JSON.
 - Applying a draft requires confirming the browser "Are you sure?" prompt.
 - Drafts are hash-checked before execution.
+- Server-side property locks prevent overlapping applies from the CLI and web UI.
+- Draft applies persist submitted Cloudbeds job references incrementally so partial writes can be reconciled.
 - Rate previews fetch each night separately so multi-night spans do not show Cloudbeds stay totals as nightly rates.
 - Fetches are capped by `MAX_FETCH_DAYS`.
 - Drafts are capped by `MAX_DRAFT_DAYS` and `MAX_DRAFT_CHANGES` (defaults: 7 nights / 100 changes).
@@ -127,6 +129,8 @@ and add named aliases such as `CLOUDBEDS_BERLIN_ENCORE_*` and
 - Smooth drafts may only remove cents and cannot decrease any rate by more than `MAX_SMOOTH_RATE_DECREASE` (default: $0.99).
 - Large-batch runs can plan up to `MAX_RUN_DAYS` nights and split work into `RUN_CHUNK_MAX_NIGHTS` / `RUN_CHUNK_MAX_CHANGES` chunks.
 - Every run chunk creates its own draft and backup before writing.
+- Daily live applies create a full-scope pre-apply backup before writing.
+- Daily runs can call `DAILY_RUN_BACKUP_SYNC_COMMAND` to copy state off the VPS.
 - Rollback runs are generated from the per-chunk backups of a prior run.
 - Every apply polls `getRateJobs` and re-reads Cloudbeds rates for verification.
 - Verification retries a few times after completed jobs because Cloudbeds readback can lag briefly behind job completion.

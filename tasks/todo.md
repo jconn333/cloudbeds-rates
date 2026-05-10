@@ -1,5 +1,19 @@
 # Task Notes
 
+## 2026-05-10 Daily live workflow hardening
+
+- [x] Add server-side run/property locking so CLI and web applies cannot overlap.
+- [x] Persist Cloudbeds job references incrementally during applies.
+- [x] Preserve partial-apply verification evidence when a write/poll fails mid-run.
+- [x] Make notification failures warning-only after successful daily runs.
+- [x] Mark rollback-readiness runs as readiness artifacts.
+- [x] Create full-scope pre-apply backups by default for daily live applies.
+- [x] Add an optional off-box backup sync hook.
+- [x] Tighten VPS systemd/docs/env examples for live automation.
+- [x] Verify syntax and Cloudbeds preflight after changes.
+
+Result: Added shared data-dir apply locks, incremental draft job persistence, `partial_apply_failed` / `apply_failed` draft states, partial-apply chunk reconciliation, default daily pre-apply backups, optional off-box backup sync via `DAILY_RUN_BACKUP_SYNC_COMMAND`, rollback-readiness metadata, warning-only success notifications, UI visibility for readiness/partial apply states, and stricter systemd templates. Verified `node --check` for server, public app, and scripts, plus `npm run preflight`. Also removed the temporary VPS `live-now.conf` timer override after the March-May Resort run completed.
+
 ## 2026-05-07 DigitalOcean VPS daily runner
 
 - [x] Record a concrete migration plan for running Cloudbeds smoothing daily without a local machine.

@@ -53,7 +53,11 @@ DAILY_RUN_PROPERTIES=berlin-encore,berlin-resort
 DAILY_RUN_START_OFFSET_DAYS=364
 DAILY_RUN_DAYS_AHEAD=1
 DAILY_RUN_OPERATOR=digitalocean-daily
+DAILY_RUN_PRE_APPLY_BACKUP=true
 DAILY_RUN_VERIFY_ROLLBACK_READINESS=true
+DAILY_RUN_LOCK_STALE_MINUTES=240
+APPLY_LOCK_STALE_MINUTES=240
+DAILY_RUN_BACKUP_SYNC_COMMAND=
 ENABLE_CLOUDBEDS_WRITES=false
 HOST=127.0.0.1
 PORT=3787
@@ -68,9 +72,15 @@ near-term dates. `DAILY_RUN_START_OFFSET_DAYS=364` plus `DAILY_RUN_DAYS_AHEAD=1`
 means each daily run covers one night about a year out; the next day's run moves
 one night closer to today.
 
-Keep `DAILY_RUN_VERIFY_ROLLBACK_READINESS=true` for live automation. After each
-successful apply, the runner creates a rollback plan from the new backup and
-fails the service if any rollback draft has conflicts.
+Keep `DAILY_RUN_PRE_APPLY_BACKUP=true` and
+`DAILY_RUN_VERIFY_ROLLBACK_READINESS=true` for live automation. Before each
+property apply, the runner creates a full-scope backup for the target window.
+After each successful apply, it creates a rollback-readiness plan from the new
+per-write backups and fails the service if any rollback draft has conflicts.
+Set `DAILY_RUN_BACKUP_SYNC_COMMAND` to an `rclone`, `restic`, or object-storage
+sync command when off-box backup storage is configured. A nonzero sync exit stops
+the daily run before live writes at the pre-apply stage, and surfaces loudly after
+rollback-readiness planning.
 
 ## Install services
 
@@ -78,6 +88,7 @@ fails the service if any rollback draft has conflicts.
 sudo cp /opt/cloudbeds-rates/deploy/systemd/cloudbeds-rates.service /etc/systemd/system/
 sudo cp /opt/cloudbeds-rates/deploy/systemd/cloudbeds-rates-daily.service /etc/systemd/system/
 sudo cp /opt/cloudbeds-rates/deploy/systemd/cloudbeds-rates-daily.timer /etc/systemd/system/
+sudo install -d -o cloudbeds-rates -g cloudbeds-rates -m 700 /opt/cloudbeds-rates/data
 sudo systemctl daemon-reload
 ```
 
@@ -153,4 +164,14 @@ cd /opt/cloudbeds-rates
 sudo -u cloudbeds-rates git pull --ff-only
 sudo -u cloudbeds-rates npm ci
 sudo systemctl restart cloudbeds-rates
+```
+
+After any temporary one-shot timer override, remove the drop-in and reload the
+timer before leaving the VPS unattended:
+
+```sh
+sudo rm -f /etc/systemd/system/cloudbeds-rates-daily.timer.d/live-now.conf
+sudo systemctl daemon-reload
+sudo systemctl restart cloudbeds-rates-daily.timer
+systemctl list-timers cloudbeds-rates-daily.timer
 ```
