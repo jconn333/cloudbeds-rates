@@ -1,5 +1,28 @@
 # Task Notes
 
+## 2026-05-11 Aggressive live smoothing window June 2026-February 2027
+
+- [x] Confirm current VPS write gates, run limits, and property scope.
+- [x] Plan the live smoothing window for Berlin Encore and Berlin Resort.
+- [ ] Apply the planned runs for 2026-06-01 through 2027-02-28 with full-scope pre-apply backups enabled.
+- [ ] Verify each applied run, per-chunk backup coverage, rollback-readiness plan, and timer health.
+
+Requirement: Keep full backups for this live window. Do not skip pre-apply backups or rollback-readiness checks.
+
+Pause note: The broad Encore apply exposed Cloudbeds linked-room behavior where ADA room rates can drift from their standard-room pair after parent/base updates. Do not resume the broad run until parity checks and correction planning are deployed.
+
+## 2026-05-11 ADA/standard room parity hardening
+
+- [x] Add business-rule parity for `1 King Deluxe` / `1 King Deluxe ADA`.
+- [x] Add business-rule parity for `2 Queen Deluxe` / `2 Queen Deluxe ADA`.
+- [x] Add read-only parity audit output before creating correction plans.
+- [x] Verify the code locally, deploy to the VPS, and inspect already-applied June 2026 dates.
+- [x] Decide whether to run a small base-only Cloudbeds inheritance test before simplifying writes.
+
+Result so far: Deployed `parityMode=standard_ada_pairs_v1`. The June 5 saved draft proves the old logic explicitly wrote `1 King Deluxe ADA` from `199.11` to `199` while `1 King Deluxe` went from `200.51` to `200`; the new parity logic proposes ADA as `200` for that date. Read-only June 2026 parity audit found 7 Encore King ADA mismatches and no missing Encore parity pairs. Berlin Resort does not have a `2 Queen Deluxe ADA` room under that exact name in the sampled base-rate rows.
+
+Base-only inheritance test: Saved full Encore one-night backup `backup_20260511112057_ae246210` for `2027-02-27` before writing. Wrote only `1 King Deluxe` rateID `810779` from `129.64` to `129.00` with Cloudbeds job `199066486`; repeated readbacks showed `1 King Deluxe ADA` stayed at `129.64`, so Cloudbeds did not cascade the base-room write to ADA. Corrected only `1 King Deluxe ADA` rateID `810949` to `129.00` with Cloudbeds job `199066530`. Final readback: King Deluxe `129`, King Deluxe ADA `129`; parity audit `mismatchCount=0`. Conclusion: do not simplify to base-only writes for these parity pairs.
+
 ## 2026-05-11 Late Cloudbeds readback reconciliation
 
 - [x] Add a readback-only reconciliation path for verification-failed chunks.

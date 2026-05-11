@@ -43,7 +43,21 @@ const SAFETY_METADATA = {
   backupSnapshotMode: "full_base_scope",
   correctiveDraftMode: "spill_repair_v1",
   rateGuardMode: "absolute_bounds_and_smooth_delta",
+  parityMode: "standard_ada_pairs_v1",
 };
+
+const ROOM_RATE_PARITY_GROUPS = [
+  {
+    key: "king-deluxe-standard-ada",
+    sourceNames: ["1 King Deluxe", "King Deluxe", "King Deluxe Standard", "1 King Deluxe Standard"],
+    matchNames: ["1 King Deluxe ADA", "King Deluxe ADA"],
+  },
+  {
+    key: "two-queen-deluxe-standard-ada",
+    sourceNames: ["2 Queen Deluxe", "Two Queen Deluxe", "2 Queen Deluxe Standard", "Two Queen Deluxe Standard"],
+    matchNames: ["2 Queen Deluxe ADA", "Two Queen Deluxe ADA"],
+  },
+];
 
 let auditDb;
 
@@ -276,6 +290,35 @@ function isSmoothRule(rule) {
   return String(rule ?? "").toLowerCase().includes("truncate cents");
 }
 
+function normalizedRoomName(value) {
+  return String(value ?? "").trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function makePlannedChange(row, proposedRate, extra = {}) {
+  return {
+    rateID: row.rateID,
+    roomTypeID: row.roomTypeID,
+    roomTypeName: row.roomTypeName,
+    date: row.date,
+    startDate: row.startDate,
+    endDate: row.endDate,
+    currentRate: money(row.currentRate),
+    proposedRate: money(proposedRate),
+    changed: !ratesEqual(row.currentRate, proposedRate),
+    isDerived: row.isDerived,
+    ...extra,
+  };
+}
+
+function changeKey(change) {
+  return `${change.date ?? change.startDate}::${change.rateID}`;
+}
+
+function findRoomByNames(rows, names) {
+  const wanted = new Set(names.map(normalizedRoomName));
+  return rows.find((row) => wanted.has(normalizedRoomName(row.roomTypeName)));
+}
+
 function assertSafeRateChanges(changes, { rule = "" } = {}) {
   for (const change of changes) {
     const proposedRate = Number(change.proposedRate);
@@ -289,6 +332,7 @@ function assertSafeRateChanges(changes, { rule = "" } = {}) {
     }
 
     if (!isSmoothRule(rule)) continue;
+    if (change.parityGroupKey) continue;
 
     const currentRate = Number(change.currentRate);
     if (!Number.isFinite(currentRate)) {
@@ -576,23 +620,97 @@ function targetRowsForDraft(rows) {
 }
 
 function plannedChangesFromRows(rows) {
-  return targetRowsForDraft(rows)
-    .map((row) => {
-      const proposedRate = smoothRate(row.currentRate);
-      return {
-        rateID: row.rateID,
-        roomTypeID: row.roomTypeID,
-        roomTypeName: row.roomTypeName,
-        date: row.date,
-        startDate: row.startDate,
-        endDate: row.endDate,
-        currentRate: row.currentRate,
-        proposedRate,
-        changed: proposedRate !== row.currentRate,
-        isDerived: row.isDerived,
-      };
-    })
-    .filter((change) => change.changed);
+  const baseRows = targetRowsForDraft(rows);
+  const changesByKey = new Map();
+
+  for (const row of baseRows) {
+    const change = makePlannedChange(row, smoothRate(row.currentRate));
+    if (change.changed) changesByKey.set(changeKey(change), change);
+  }
+
+  const rowsByDate = new Map();
+  for (const row of baseRows) {
+    const dateRows = rowsByDate.get(row.date) ?? [];
+    dateRows.push(row);
+    rowsByDate.set(row.date, dateRows);
+  }
+
+  for (const [date, dateRows] of rowsByDate) {
+    for (const group of ROOM_RATE_PARITY_GROUPS) {
+      const source = findRoomByNames(dateRows, group.sourceNames);
+      const match = findRoomByNames(dateRows, group.matchNames);
+      if (!source || !match) continue;
+
+      const sourceProposedRate = smoothRate(source.currentRate);
+      const sourceChange = makePlannedChange(source, sourceProposedRate, {
+        parityGroupKey: group.key,
+        parityRole: "source",
+      });
+      if (sourceChange.changed) changesByKey.set(changeKey(sourceChange), sourceChange);
+
+      const matchChange = makePlannedChange(match, sourceProposedRate, {
+        parityGroupKey: group.key,
+        parityRole: "match",
+        paritySourceRateID: source.rateID,
+        paritySourceRoomTypeName: source.roomTypeName,
+      });
+      if (matchChange.changed) changesByKey.set(changeKey(matchChange), matchChange);
+    }
+  }
+
+  return [...changesByKey.values()].sort(
+    (a, b) => a.date.localeCompare(b.date) || a.roomTypeName.localeCompare(b.roomTypeName)
+  );
+}
+
+function buildParityAudit(rows) {
+  const baseRows = targetRowsForDraft(rows);
+  const rowsByDate = new Map();
+  for (const row of baseRows) {
+    const dateRows = rowsByDate.get(row.date) ?? [];
+    dateRows.push(row);
+    rowsByDate.set(row.date, dateRows);
+  }
+
+  const pairs = [];
+  for (const [date, dateRows] of rowsByDate) {
+    for (const group of ROOM_RATE_PARITY_GROUPS) {
+      const source = findRoomByNames(dateRows, group.sourceNames);
+      const match = findRoomByNames(dateRows, group.matchNames);
+      if (!source || !match) {
+        pairs.push({
+          date,
+          parityGroupKey: group.key,
+          status: "missing_room",
+          sourceRoomTypeName: source?.roomTypeName ?? null,
+          matchRoomTypeName: match?.roomTypeName ?? null,
+        });
+        continue;
+      }
+
+      const expectedRate = smoothRate(source.currentRate);
+      const actualParityMismatch = !ratesEqual(match.currentRate, source.currentRate);
+      const sourceNeedsSmoothing = !ratesEqual(source.currentRate, expectedRate);
+      const matchNeedsCorrection = !ratesEqual(match.currentRate, expectedRate);
+      pairs.push({
+        date,
+        parityGroupKey: group.key,
+        status: actualParityMismatch ? "mismatch" : sourceNeedsSmoothing || matchNeedsCorrection ? "needs_smoothing" : "ok",
+        sourceRateID: source.rateID,
+        sourceRoomTypeName: source.roomTypeName,
+        sourceCurrentRate: money(source.currentRate),
+        matchRateID: match.rateID,
+        matchRoomTypeName: match.roomTypeName,
+        matchCurrentRate: money(match.currentRate),
+        expectedRate,
+        actualDifference: money(match.currentRate) - money(source.currentRate),
+        actualParityMismatch,
+        matchNeedsCorrection,
+        sourceNeedsSmoothing,
+      });
+    }
+  }
+  return pairs.sort((a, b) => a.date.localeCompare(b.date) || a.parityGroupKey.localeCompare(b.parityGroupKey));
 }
 
 function normalizeRollbackChanges(changes) {
@@ -1932,8 +2050,12 @@ async function assessChunkLiveState(run, chunk) {
   const property = resolveProperty(run.propertyKey ?? run.propertyId);
   const fetched = await fetchRatePlans(chunk.startDate, chunk.endDate, property);
   const adjacentRows = await fetchBaseRowsForDates(buildAdjacentRiskDates(chunk.changes), property);
-  const actionableChanges = [];
-  const alreadySmooth = [];
+  const freshChanges = plannedChangesFromRows(fetched.rows);
+  const freshChangeKeys = new Set(freshChanges.map(changeKey));
+  const fetchedKeys = new Set(fetched.rows.map((row) => `${row.date}::${row.rateID}`));
+  const alreadySmooth = chunk.changes
+    .filter((change) => fetchedKeys.has(changeKey(change)) && !freshChangeKeys.has(changeKey(change)))
+    .map((change) => ({ ...change, liveRate: null }));
   const drifted = [];
 
   for (const change of chunk.changes) {
@@ -1946,28 +2068,9 @@ async function assessChunkLiveState(run, chunk) {
       });
       continue;
     }
-    if (ratesEqual(liveRow.currentRate, change.proposedRate)) {
-      alreadySmooth.push({
-        ...change,
-        liveRate: money(liveRow.currentRate),
-      });
-      continue;
-    }
-    if (!ratesEqual(liveRow.currentRate, change.currentRate)) {
-      drifted.push({
-        ...change,
-        reason: `Live rate changed from planned ${money(change.currentRate).toFixed(2)} to ${money(liveRow.currentRate).toFixed(2)} before this chunk applied.`,
-        liveRate: money(liveRow.currentRate),
-      });
-      continue;
-    }
-    actionableChanges.push({
-      ...change,
-      currentRate: money(liveRow.currentRate),
-    });
   }
 
-  return { fetched, adjacentRows, actionableChanges, alreadySmooth, drifted };
+  return { fetched, adjacentRows, actionableChanges: freshChanges, alreadySmooth, drifted };
 }
 
 async function applyRun(id, options = {}) {
@@ -2310,6 +2413,8 @@ app.get("/api/rates", async (req, res) => {
     assertDate(startDate, "startDate");
     assertDate(endDate, "endDate");
     const fetched = await fetchRatePlans(startDate, endDate, property);
+    const plannedChanges = plannedChangesFromRows(fetched.rows);
+    const plannedChangeByKey = new Map(plannedChanges.map((change) => [changeKey(change), change]));
     res.json({
       propertyKey: property.key,
       propertyId: property.propertyId,
@@ -2319,8 +2424,39 @@ app.get("/api/rates", async (req, res) => {
       rows: fetched.rows.map(({ raw, ...row }) => ({
         ...row,
         targetByDefault: targetRowsForDraft(fetched.rows).some((target) => target.rateID === row.rateID && target.date === row.date),
-        proposedRate: smoothRate(row.currentRate),
+        proposedRate: plannedChangeByKey.get(`${row.date}::${row.rateID}`)?.proposedRate ?? smoothRate(row.currentRate),
+        parityGroupKey: plannedChangeByKey.get(`${row.date}::${row.rateID}`)?.parityGroupKey ?? null,
+        parityRole: plannedChangeByKey.get(`${row.date}::${row.rateID}`)?.parityRole ?? null,
       })),
+    });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.get("/api/parity-audit", async (req, res) => {
+  try {
+    const property = resolveProperty(req.query.propertyKey ?? DEFAULT_PROPERTY_KEY);
+    const startDate = String(req.query.startDate ?? "");
+    const endDate = String(req.query.endDate ?? nextDay(startDate));
+    assertDate(startDate, "startDate");
+    assertDate(endDate, "endDate");
+    assertFetchScope(startDate, endDate);
+    const fetched = await fetchRatePlans(startDate, endDate, property);
+    const pairs = buildParityAudit(fetched.rows);
+    res.json({
+      propertyKey: property.key,
+      propertyId: property.propertyId,
+      propertyName: property.propertyName,
+      startDate,
+      endDate,
+      summary: {
+        pairCount: pairs.length,
+        mismatchCount: pairs.filter((pair) => pair.status === "mismatch").length,
+        smoothingOnlyCount: pairs.filter((pair) => pair.status === "needs_smoothing").length,
+        missingRoomCount: pairs.filter((pair) => pair.status === "missing_room").length,
+      },
+      pairs,
     });
   } catch (error) {
     res.status(400).json({ error: error.message });

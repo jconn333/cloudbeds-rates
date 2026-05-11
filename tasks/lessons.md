@@ -43,3 +43,9 @@
 - Adjacent-night verification for multi-night chunks must exclude dates that are also targeted within the same draft; otherwise legitimate in-chunk updates are mislabeled as adjacent mismatches and the run pauses falsely.
 
 - Rollback draft hashes must be generated from the same shared `buildDraftPayload(...)` shape used at apply time; even identical field values will fail if creation hashes a differently ordered object.
+
+- During a large run, pre-apply drift can be benign if Cloudbeds recalculates a live base rate before the chunk writes. It is safe to rebase that row only when the fresh live value still produces a smooth-only change under the normal rate guardrails; missing rows and unsafe changes should still pause.
+
+- Standard and ADA variants for the same room class are business-rule parity pairs, not independent smoothing targets. For Berlin Encore, `1 King Deluxe ADA` should match `1 King Deluxe`, and `2 Queen Deluxe ADA` should match `2 Queen Deluxe`; audit and correct those pairs explicitly instead of trusting Cloudbeds linked-rate recalculation to preserve parity.
+
+- A controlled Encore base-only test on `2027-02-27` showed Cloudbeds did not cascade a `1 King Deluxe` write to `1 King Deluxe ADA`: King changed from `129.64` to `129.00`, while ADA stayed `129.64` until explicitly corrected. Do not rely on base-only writes to preserve ADA parity.

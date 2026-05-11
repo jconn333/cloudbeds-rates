@@ -137,6 +137,14 @@ function addDays(dateText, days) {
   return date.toISOString().slice(0, 10);
 }
 
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function hasPostApplyVerificationFailure(run) {
+  return run.chunks.some((chunk) => ["verification_failed", "partial_apply_failed"].includes(chunk.status));
+}
+
 async function withLock(name, fn) {
   const lockFile = path.join(getDataDir(), "locks", `${name}.lock`);
   const staleMinutes = Number(process.env.DAILY_RUN_LOCK_STALE_MINUTES ?? "240");
@@ -359,7 +367,7 @@ async function runProperty(propertyKey, options) {
       : null;
     let appliedRun = await applyRun(run.id);
     console.log(`Applied run ${appliedRun.id}: ${summarize(appliedRun)}.`);
-    if (appliedRun.status !== "applied") {
+    if (appliedRun.status !== "applied" && hasPostApplyVerificationFailure(appliedRun)) {
       appliedRun = await reconcileAppliedRun(appliedRun, options);
     }
     const rollbackReadiness = options.verifyRollbackReadiness
