@@ -79,7 +79,8 @@ The DigitalOcean VPS runs this app from `/opt/cloudbeds-rates` with secrets in
 There are two systemd surfaces:
 
 - `cloudbeds-rates.service` runs the local-only web UI on `127.0.0.1:3787`.
-- `cloudbeds-rates-daily.timer` schedules `cloudbeds-rates-daily.service`.
+- `cloudbeds-rates-daily.timer` schedules `cloudbeds-rates-daily.service` daily
+  at 10:00 AM America/New_York, with a small randomized delay.
 
 The current rollout mode is controlled live timer testing against far-future 2027
 dates. Keep the web UI local-only and review timer logs, recent runs,

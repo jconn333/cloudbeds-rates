@@ -11,7 +11,8 @@ runs the deterministic CLI instead of clicking the web app.
 - Durable state: `/opt/cloudbeds-rates/data`
 - Web service: `cloudbeds-rates.service`
 - Daily run: `cloudbeds-rates-daily.service`
-- Daily timer: `cloudbeds-rates-daily.timer`
+- Daily timer: `cloudbeds-rates-daily.timer` at 10:00 AM America/New_York, plus
+  a small randomized delay.
 
 ## First-time setup
 
@@ -125,6 +126,9 @@ Only after a clean dry-run plan:
 sudo systemctl enable --now cloudbeds-rates-daily.timer
 systemctl list-timers cloudbeds-rates-daily.timer
 ```
+
+The timer uses the VPS local timezone. Production VPS timezone is
+`America/New_York`; the checked-in timer runs daily at 10:00 AM Eastern.
 
 When ready for live writes, edit `/etc/cloudbeds-rates.env`:
 
