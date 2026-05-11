@@ -2,11 +2,13 @@
 
 ## 2026-05-11 Late Cloudbeds readback reconciliation
 
-- [ ] Add a readback-only reconciliation path for verification-failed chunks.
-- [ ] Let daily automation wait/reconcile transient Cloudbeds readback lag before failing rollback readiness.
-- [ ] Expose reconciliation in the app/API without sending new Cloudbeds writes.
-- [ ] Reconcile the paused Encore March-May 2027 run and resume only if verification is clean.
-- [ ] Verify, commit, push, and deploy.
+- [x] Add a readback-only reconciliation path for verification-failed chunks.
+- [x] Let daily automation wait/reconcile transient Cloudbeds readback lag before failing rollback readiness.
+- [x] Expose reconciliation in the app/API without sending new Cloudbeds writes.
+- [x] Reconcile the paused Encore March-May 2027 run and resume only if verification is clean.
+- [x] Verify, commit, push, and deploy.
+
+Result: Added `/api/runs/:id/reconcile`, `reconcileRunVerification`, and daily-run late reconcile attempts. The paused Encore run `run_20260511091735_e0cae15a` reconciled chunk 3 from delayed Cloudbeds readback without rewriting, then resumed from chunk 4 and completed all 330 changes across 10 chunks with 330/330 verified. Rollback plan `run_20260511101853_7ac9144c` was created with 10 ready chunks and 330 rollback changes. Deployed commit `2ba88be`; VPS web service and timer are active, daily service is inactive between runs.
 
 ## 2026-05-10 Daily live workflow hardening
 
