@@ -23,6 +23,8 @@ Result so far: Deployed `parityMode=standard_ada_pairs_v1`. The June 5 saved dra
 
 Base-only inheritance test: Saved full Encore one-night backup `backup_20260511112057_ae246210` for `2027-02-27` before writing. Wrote only `1 King Deluxe` rateID `810779` from `129.64` to `129.00` with Cloudbeds job `199066486`; repeated readbacks showed `1 King Deluxe ADA` stayed at `129.64`, so Cloudbeds did not cascade the base-room write to ADA. Corrected only `1 King Deluxe ADA` rateID `810949` to `129.00` with Cloudbeds job `199066530`. Final readback: King Deluxe `129`, King Deluxe ADA `129`; parity audit `mismatchCount=0`. Conclusion: do not simplify to base-only writes for these parity pairs.
 
+Correction result: Saved fresh full Encore backup `backup_20260511145744_56cd4a61` for `2026-06-05..2026-06-20` before correcting the seven King Deluxe ADA mismatches. Applied only `1 King Deluxe ADA` rateID `810949` on `2026-06-05`, `2026-06-06`, `2026-06-12`, `2026-06-13`, `2026-06-16`, `2026-06-19`, and `2026-06-20`; Cloudbeds jobs `199117201`, `199117208`, `199117214`, `199117222`, `199117230`, `199117240`, and `199117249` completed with one update each. Direct readback showed all seven King Deluxe / King Deluxe ADA pairs matching. Read-only parity audits returned `mismatchCount=0` for June 2026 and for the full `2026-06-01..2027-02-28` Encore window.
+
 ## 2026-05-11 Late Cloudbeds readback reconciliation
 
 - [x] Add a readback-only reconciliation path for verification-failed chunks.
