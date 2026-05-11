@@ -144,6 +144,12 @@ function summarizeRunEvent(event) {
       return `Chunk ${payload.chunkSequence} verified ${payload.verifiedCount ?? 0}/${payload.changeCount ?? 0} row(s).`;
     case "run_chunk_verification_failed":
       return `Chunk ${payload.chunkSequence} only verified ${payload.verifiedCount ?? 0}/${payload.changeCount ?? 0} row(s).`;
+    case "run_chunk_reconcile_verified":
+      return `Reconciled chunk ${payload.chunkSequence}; delayed readback now verifies ${payload.verifiedCount ?? 0}/${payload.changeCount ?? 0} row(s).`;
+    case "run_chunk_reconcile_failed":
+      return `Reconcile still failed for chunk ${payload.chunkSequence}; ${payload.verifiedCount ?? 0}/${payload.changeCount ?? 0} row(s) verified.`;
+    case "run_reconcile_finished":
+      return `Run reconciliation finished with status ${payload.status ?? "unknown"}.`;
     case "run_apply_failed":
       return payload.error ?? "Run apply failed.";
     case "run_apply_finished":
@@ -622,6 +628,7 @@ function renderRunDetail(run) {
   const canRollback = !run.readinessOnly && run.type === "smooth" && appliedChunks > 0;
   const primaryAction = runPrimaryAction(run, failedChunks, appliedChunks);
   const canRetryFailedChunk = !run.readinessOnly && failedChunks > 0 && state.config.writesEnabled;
+  const canReconcile = !run.readinessOnly && failedChunks > 0;
   $("runDetail").className = "draft-detail";
   $("runDetail").innerHTML = `
     <div class="summary-grid">
@@ -645,6 +652,7 @@ function renderRunDetail(run) {
           ? `<button id="applyRun" data-run-mode="${escapeHtml(primaryAction.mode)}" type="button"${resumable && state.config.writesEnabled ? "" : " disabled"}>${escapeHtml(primaryAction.label)}</button>`
           : ""
       }
+      <button id="reconcileRun" type="button" class="secondary"${canReconcile ? "" : " disabled"}>Recheck Failed Readback</button>
       <button id="retryFailedChunk" type="button" class="secondary"${canRetryFailedChunk ? "" : " disabled"}>Retry Failed Chunk Only</button>
       <button id="createSpillCorrectionDraft" type="button" class="secondary"${canCreateSpillRepairDraft ? "" : " disabled"}>Create Spill Repair Draft</button>
       <button id="createRollbackRun" type="button" class="secondary"${canRollback ? "" : " disabled"}>Create Rollback Run</button>
@@ -675,6 +683,7 @@ function renderRunDetail(run) {
   `;
 
   $("applyRun")?.addEventListener("click", applySelectedRun);
+  $("reconcileRun")?.addEventListener("click", reconcileSelectedRun);
   $("retryFailedChunk")?.addEventListener("click", retryFailedChunk);
   $("createSpillCorrectionDraft")?.addEventListener("click", createSpillCorrectionDraft);
   $("createRollbackRun")?.addEventListener("click", createRollbackRun);
@@ -1212,6 +1221,50 @@ async function retryFailedChunk() {
     await loadRun(run.id).catch(() => {});
   } finally {
     stopPolling();
+  }
+}
+
+async function reconcileSelectedRun() {
+  const run = state.latestRun;
+  if (!run) return;
+  const button = $("reconcileRun");
+  const applyButton = $("applyRun");
+  const retryButton = $("retryFailedChunk");
+  if (button) {
+    button.disabled = true;
+    button.textContent = "Rechecking...";
+  }
+  if (applyButton) applyButton.disabled = true;
+  if (retryButton) retryButton.disabled = true;
+
+  try {
+    setMessage("Rechecking failed chunk readback without writing...");
+    const json = await api(`/api/runs/${run.id}/reconcile`, {
+      method: "POST",
+      body: JSON.stringify({ operator: "web-app-reconcile" }),
+    });
+    const events = await api(`/api/runs/${run.id}/events?limit=20`);
+    state.latestRunEvents = events.events;
+    renderRunDetail(json.run);
+    await loadRuns();
+    await loadDrafts();
+    await loadBackups();
+    await loadAudit();
+    setMessage(
+      json.run.status === "applied"
+        ? "Delayed Cloudbeds readback now verifies cleanly."
+        : `Recheck finished with status ${json.run.status}.`,
+      json.run.status === "applied" ? "good" : "error"
+    );
+  } catch (error) {
+    setMessage(error.message, "error");
+  } finally {
+    if (button) {
+      button.textContent = "Recheck Failed Readback";
+      button.disabled = false;
+    }
+    if (applyButton) applyButton.disabled = false;
+    if (retryButton) retryButton.disabled = false;
   }
 }
 

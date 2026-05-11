@@ -34,6 +34,8 @@ const MAX_ALLOWED_RATE = Number(process.env.MAX_ALLOWED_RATE ?? "999.99");
 const MAX_SMOOTH_RATE_DECREASE = Number(process.env.MAX_SMOOTH_RATE_DECREASE ?? "0.99");
 const VERIFY_RETRY_ATTEMPTS = Number(process.env.VERIFY_RETRY_ATTEMPTS ?? "4");
 const VERIFY_RETRY_DELAY_MS = Number(process.env.VERIFY_RETRY_DELAY_MS ?? "3000");
+const RECONCILE_RETRY_ATTEMPTS = Number(process.env.RECONCILE_RETRY_ATTEMPTS ?? "1");
+const RECONCILE_RETRY_DELAY_MS = Number(process.env.RECONCILE_RETRY_DELAY_MS ?? "0");
 const APPLY_LOCK_STALE_MINUTES = Number(process.env.APPLY_LOCK_STALE_MINUTES ?? "240");
 const SAFETY_METADATA = {
   writeIntervalMode: "same_day",
@@ -1405,6 +1407,72 @@ async function verifyDraftIntegrity(draft, backup, propertyContext = resolveDefa
   return { targetedVerification, scopeVerification, adjacentVerification, summary };
 }
 
+async function reconcileAppliedDraft(id, options = {}) {
+  const draft = await getDraft(id);
+  const backup = await getBackup(draft.backupId);
+  const property = resolveProperty(draft.propertyKey ?? draft.propertyId);
+  if (!["verification_failed", "partial_apply_failed", "applied"].includes(draft.status)) {
+    throw new Error(`Draft is ${draft.status}; only applied or post-apply verification states can be reconciled.`);
+  }
+  if (!(draft.jobs ?? []).length) throw new Error("Draft has no submitted Cloudbeds jobs to reconcile.");
+
+  const attempts = Math.max(1, Number(options.attempts ?? RECONCILE_RETRY_ATTEMPTS));
+  const delayMs = Math.max(0, Number(options.delayMs ?? RECONCILE_RETRY_DELAY_MS));
+  let verificationResult;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    verificationResult = await verifyDraftIntegrity(draft, backup, property);
+    if (verificationResult.summary.allVerified || attempt === attempts) break;
+    if (delayMs) await wait(delayMs);
+  }
+
+  const reconciledStatus = verificationResult.summary.allVerified ? "applied" : draft.status;
+  const reconciledDraft = {
+    ...draft,
+    status: reconciledStatus,
+    verification: verificationResult.targetedVerification,
+    scopeVerification: verificationResult.scopeVerification,
+    adjacentVerification: verificationResult.adjacentVerification,
+    verificationSummary: verificationResult.summary,
+    reconciledAt: isoNow(),
+    reconcileSummary: {
+      attempts,
+      allVerified: verificationResult.summary.allVerified,
+      previousStatus: draft.status,
+    },
+    ...(reconciledStatus === "applied"
+      ? { error: null, partialApply: undefined }
+      : { error: describeVerificationFailure(verificationResult.summary) }),
+  };
+  if (reconciledStatus === "applied") {
+    delete reconciledDraft.partialApply;
+    delete reconciledDraft.writeError;
+    delete reconciledDraft.pollErrors;
+  }
+  await writeJson(path.join(DRAFTS_DIR, `${id}.json`), reconciledDraft);
+  auditEvent({
+    type: verificationResult.summary.allVerified ? "draft_reconcile_verified" : "draft_reconcile_still_mismatched",
+    operator: options.operator ?? "reconcile",
+    entityType: "draft",
+    entityId: id,
+    propertyId: draft.propertyId,
+    startDate: draft.startDate,
+    endDate: draft.endDate,
+    payload: {
+      previousStatus: draft.status,
+      status: reconciledStatus,
+      attempts,
+      targetedVerifiedCount: verificationResult.summary.targetedVerifiedCount,
+      targetedCount: verificationResult.summary.targetedCount,
+      untouchedScopeVerifiedCount: verificationResult.summary.untouchedScopeVerifiedCount,
+      untouchedScopeCount: verificationResult.summary.untouchedScopeCount,
+      adjacentVerifiedCount: verificationResult.summary.adjacentVerifiedCount,
+      adjacentCount: verificationResult.summary.adjacentCount,
+      adjacentSuspiciousCount: verificationResult.summary.adjacentSuspiciousCount,
+    },
+  });
+  return reconciledDraft;
+}
+
 async function applyDraft(id, confirmation, options = {}) {
   if (!options.skipLock) {
     const draftForLock = await getDraft(id);
@@ -1740,6 +1808,97 @@ async function refreshChunkFromDraft(run, chunk) {
   });
   await saveRun(run);
   return true;
+}
+
+async function reconcileRunVerification(id, options = {}) {
+  await initializeStorage();
+  if (!options.skipLock) {
+    const runForLock = await getRun(id);
+    const propertyForLock = resolveProperty(runForLock.propertyKey ?? runForLock.propertyId);
+    return withDataLock(`apply-${propertyForLock.key}`, () =>
+      reconcileRunVerification(id, { ...options, skipLock: true })
+    );
+  }
+
+  const run = await getRun(id);
+  resolveProperty(run.propertyKey ?? run.propertyId);
+  const failedChunks = run.chunks.filter(
+    (chunk) => chunk.draftId && ["verification_failed", "partial_apply_failed"].includes(chunk.status)
+  );
+  if (!failedChunks.length) return run;
+
+  updateRunProgress(run, {
+    phase: "reconciling",
+    activeChunkSequence: failedChunks[0].sequence,
+    message: `Rechecking ${failedChunks.length} post-apply verification chunk(s) without writing.`,
+  });
+  await saveRun(run);
+
+  for (const chunk of failedChunks) {
+    const draft = await reconcileAppliedDraft(chunk.draftId, {
+      operator: options.operator ?? run.operator ?? "run-reconcile",
+      attempts: options.attempts,
+      delayMs: options.delayMs,
+    });
+    chunk.status = draft.status;
+    chunk.appliedAt = draft.appliedAt ?? chunk.appliedAt ?? null;
+    chunk.verifiedCount = (draft.verification ?? []).filter((item) => item.verified).length;
+    chunk.error =
+      draft.status === "applied"
+        ? null
+        : draft.error ?? describeVerificationFailure(draft.verificationSummary ?? {});
+    if (draft.partialApply) {
+      chunk.partialApply = draft.partialApply;
+    } else {
+      delete chunk.partialApply;
+    }
+    updateRunProgress(run, {
+      phase: draft.status === "applied" ? "reconciling" : "paused",
+      activeChunkSequence: null,
+      failedChunkSequence: draft.status === "applied" ? null : chunk.sequence,
+      message:
+        draft.status === "applied"
+          ? `Reconciled chunk ${chunk.sequence}; delayed Cloudbeds readback now verifies ${chunk.verifiedCount}/${draft.changes.length} row(s).`
+          : `Chunk ${chunk.sequence} still fails verification after reconcile: ${chunk.error}`,
+    });
+    await saveRun(run);
+    auditEvent({
+      type: draft.status === "applied" ? "run_chunk_reconcile_verified" : "run_chunk_reconcile_failed",
+      operator: options.operator ?? run.operator ?? "run-reconcile",
+      entityType: "run",
+      entityId: run.id,
+      propertyId: run.propertyId,
+      startDate: chunk.startDate,
+      endDate: chunk.endDate,
+      payload: {
+        chunkId: chunk.id,
+        chunkSequence: chunk.sequence,
+        draftId: draft.id,
+        status: draft.status,
+        verifiedCount: chunk.verifiedCount,
+        changeCount: draft.changes.length,
+      },
+    });
+    if (draft.status !== "applied") {
+      run.status = "paused";
+      await saveRun(run);
+      return run;
+    }
+  }
+
+  finalizeRunStatus(run);
+  await saveRun(run);
+  auditEvent({
+    type: "run_reconcile_finished",
+    operator: options.operator ?? run.operator ?? "run-reconcile",
+    entityType: "run",
+    entityId: run.id,
+    propertyId: run.propertyId,
+    startDate: run.startDate,
+    endDate: run.endDate,
+    payload: { status: run.status, reconciledChunks: failedChunks.length },
+  });
+  return run;
 }
 
 function findLiveRow(rows, change) {
@@ -2269,6 +2428,15 @@ app.post("/api/runs/:id/apply", async (req, res) => {
   }
 });
 
+app.post("/api/runs/:id/reconcile", async (req, res) => {
+  try {
+    const run = await reconcileRunVerification(req.params.id, req.body ?? {});
+    res.json({ run });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
 app.post("/api/runs/:id/rollback-plan", async (req, res) => {
   try {
     const run = await createRollbackRunFromRun(req.params.id, req.body?.operator ?? "web-app");
@@ -2329,6 +2497,7 @@ export {
   getRun,
   initializeStorage,
   listRuns,
+  reconcileRunVerification,
   resolveDefaultProperty,
   resolveProperty,
   startServer,

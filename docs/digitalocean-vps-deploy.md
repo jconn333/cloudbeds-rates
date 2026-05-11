@@ -55,8 +55,12 @@ DAILY_RUN_DAYS_AHEAD=1
 DAILY_RUN_OPERATOR=digitalocean-daily
 DAILY_RUN_PRE_APPLY_BACKUP=true
 DAILY_RUN_VERIFY_ROLLBACK_READINESS=true
+DAILY_RUN_RECONCILE_ATTEMPTS=6
+DAILY_RUN_RECONCILE_DELAY_MS=30000
 DAILY_RUN_LOCK_STALE_MINUTES=240
 APPLY_LOCK_STALE_MINUTES=240
+RECONCILE_RETRY_ATTEMPTS=1
+RECONCILE_RETRY_DELAY_MS=0
 DAILY_RUN_BACKUP_SYNC_COMMAND=
 ENABLE_CLOUDBEDS_WRITES=false
 HOST=127.0.0.1
@@ -81,6 +85,11 @@ Set `DAILY_RUN_BACKUP_SYNC_COMMAND` to an `rclone`, `restic`, or object-storage
 sync command when off-box backup storage is configured. A nonzero sync exit stops
 the daily run before live writes at the pre-apply stage, and surfaces loudly after
 rollback-readiness planning.
+
+`DAILY_RUN_RECONCILE_ATTEMPTS` and `DAILY_RUN_RECONCILE_DELAY_MS` protect against
+Cloudbeds readback lag after completed jobs. The runner rechecks failed
+post-apply verification chunks without rewriting before it treats the run as
+failed.
 
 ## Install services
 

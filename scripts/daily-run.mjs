@@ -14,6 +14,7 @@ import {
   getRun,
   initializeStorage,
   listRuns,
+  reconcileRunVerification,
   resolveProperty,
 } from "../server.mjs";
 
@@ -49,6 +50,8 @@ function parseArgs(argv) {
     operator: process.env.DAILY_RUN_OPERATOR ?? "daily-run",
     verifyRollbackReadiness: String(process.env.DAILY_RUN_VERIFY_ROLLBACK_READINESS ?? "true").toLowerCase() !== "false",
     preApplyBackup: String(process.env.DAILY_RUN_PRE_APPLY_BACKUP ?? "true").toLowerCase() !== "false",
+    reconcileAttempts: Number(process.env.DAILY_RUN_RECONCILE_ATTEMPTS ?? "6"),
+    reconcileDelayMs: Number(process.env.DAILY_RUN_RECONCILE_DELAY_MS ?? "30000"),
     properties: [],
     startDate: process.env.DAILY_RUN_START_DATE ?? null,
     startOffsetDays:
@@ -277,6 +280,26 @@ async function createPreApplyBackup(property, startDate, endDate, operator, auto
   return backup;
 }
 
+async function reconcileAppliedRun(run, options) {
+  let currentRun = run;
+  for (let attempt = 1; attempt <= options.reconcileAttempts; attempt += 1) {
+    if (currentRun.status === "applied") return currentRun;
+    if (attempt > 1 && options.reconcileDelayMs > 0) await wait(options.reconcileDelayMs);
+    currentRun = await reconcileRunVerification(currentRun.id, {
+      operator: `${options.operator}-late-reconcile`,
+      attempts: 1,
+      delayMs: 0,
+    });
+    if (currentRun.status === "applied") {
+      console.log(`Late reconcile verified ${currentRun.id} on attempt ${attempt}.`);
+      return currentRun;
+    }
+    const message = currentRun.progress?.message ?? `${currentRun.id} remains ${currentRun.status}`;
+    console.log(`Late reconcile attempt ${attempt}/${options.reconcileAttempts} did not verify ${currentRun.id}: ${message}`);
+  }
+  return currentRun;
+}
+
 async function findExistingRun(automationKey) {
   const runs = await listRuns();
   const existing = runs.find((run) => run.automationKey === automationKey);
@@ -334,8 +357,11 @@ async function runProperty(propertyKey, options) {
     const preApplyBackup = options.preApplyBackup
       ? await createPreApplyBackup(property, startDate, endDate, options.operator, automationKey)
       : null;
-    const appliedRun = await applyRun(run.id);
+    let appliedRun = await applyRun(run.id);
     console.log(`Applied run ${appliedRun.id}: ${summarize(appliedRun)}.`);
+    if (appliedRun.status !== "applied") {
+      appliedRun = await reconcileAppliedRun(appliedRun, options);
+    }
     const rollbackReadiness = options.verifyRollbackReadiness
       ? await verifyRollbackReadiness(appliedRun, options.operator)
       : { needed: false, message: `Rollback readiness skipped for ${appliedRun.id}.` };

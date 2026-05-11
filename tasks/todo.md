@@ -1,5 +1,13 @@
 # Task Notes
 
+## 2026-05-11 Late Cloudbeds readback reconciliation
+
+- [ ] Add a readback-only reconciliation path for verification-failed chunks.
+- [ ] Let daily automation wait/reconcile transient Cloudbeds readback lag before failing rollback readiness.
+- [ ] Expose reconciliation in the app/API without sending new Cloudbeds writes.
+- [ ] Reconcile the paused Encore March-May 2027 run and resume only if verification is clean.
+- [ ] Verify, commit, push, and deploy.
+
 ## 2026-05-10 Daily live workflow hardening
 
 - [x] Add server-side run/property locking so CLI and web applies cannot overlap.

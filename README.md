@@ -48,6 +48,13 @@ pre-apply backup and after rollback-readiness planning. The command receives
 `DAILY_RUN_SYNC_RUN_ID`, `DAILY_RUN_SYNC_BACKUP_ID`,
 `DAILY_RUN_SYNC_START_DATE`, and `DAILY_RUN_SYNC_END_DATE`.
 
+If Cloudbeds reports jobs as completed but `getRatePlans` still shows stale
+rates, the daily runner performs readback-only late reconciliation before it
+fails rollback readiness. This is controlled by `DAILY_RUN_RECONCILE_ATTEMPTS`
+and `DAILY_RUN_RECONCILE_DELAY_MS`. Reconciliation never sends new `putRate`
+calls; it only re-reads Cloudbeds and updates the saved run/draft when the
+delayed readback verifies cleanly.
+
 For lower-risk live rollout, work from far-future dates back toward near-term
 dates. For example, this plans one night roughly a year out; tomorrow's scheduled
 run naturally moves one day closer because the offset is recalculated from that
@@ -121,6 +128,7 @@ and add named aliases such as `CLOUDBEDS_BERLIN_ENCORE_*` and
 - Drafts are hash-checked before execution.
 - Server-side property locks prevent overlapping applies from the CLI and web UI.
 - Draft applies persist submitted Cloudbeds job references incrementally so partial writes can be reconciled.
+- Failed post-apply readbacks can be reconciled without rewriting rates.
 - Rate previews fetch each night separately so multi-night spans do not show Cloudbeds stay totals as nightly rates.
 - Fetches are capped by `MAX_FETCH_DAYS`.
 - Drafts are capped by `MAX_DRAFT_DAYS` and `MAX_DRAFT_CHANGES` (defaults: 7 nights / 100 changes).
