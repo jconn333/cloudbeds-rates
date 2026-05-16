@@ -49,3 +49,9 @@
 - Standard and ADA variants for the same room class are business-rule parity pairs, not independent smoothing targets. For Berlin Encore, `1 King Deluxe ADA` should match `1 King Deluxe`, and `2 Queen Deluxe ADA` should match `2 Queen Deluxe`; audit and correct those pairs explicitly instead of trusting Cloudbeds linked-rate recalculation to preserve parity.
 
 - A controlled Encore base-only test on `2027-02-27` showed Cloudbeds did not cascade a `1 King Deluxe` write to `1 King Deluxe ADA`: King changed from `129.64` to `129.00`, while ADA stayed `129.64` until explicitly corrected. Do not rely on base-only writes to preserve ADA parity.
+
+- A paused run can be safe to continue automatically after late reconcile if the previously failed chunk is now `applied` and the only remaining non-terminal chunks are still `planned`. Treat that as a continuation state for the daily runner; do not run rollback readiness until the remaining planned chunks have been applied or skipped.
+
+- Retrying a failed chunk automatically is acceptable only inside a tight evidence envelope: one post-apply failed chunk, draft and backup ids present, all applied/failed chunks backed up, untouched and adjacent verification clean, zero suspicious adjacent spill rows, and only small targeted whole-dollar smoothing mismatches. Outside that envelope, keep the run paused and notify.
+
+- Zero-change daily runs do not need full pre-apply backups because no Cloudbeds writes will occur; skipping those backups avoids hundreds of unnecessary read calls and shortens no-op days.

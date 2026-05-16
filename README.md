@@ -33,14 +33,15 @@ is not enough. The daily runner uses `DAILY_RUN_PROPERTIES`,
 run, uses a per-property lock file, and refuses to apply paused or otherwise
 non-planned runs unattended.
 
-Before every live `daily:apply`, the runner creates a full-scope pre-apply backup
-for the property/window unless `DAILY_RUN_PRE_APPLY_BACKUP=false` or
-`--skip-pre-apply-backup` is used. After every successful apply, it immediately
-creates a rollback-readiness plan from the new per-write backups and checks every
-rollback draft for conflicts. If rollback readiness fails, the command exits
-nonzero so systemd/journald and the Codex review loop surface it. This can be
-disabled only by setting `DAILY_RUN_VERIFY_ROLLBACK_READINESS=false` or passing
-`--skip-rollback-readiness`.
+Before every live `daily:apply` that has changes, the runner creates a full-scope
+pre-apply backup for the property/window unless `DAILY_RUN_PRE_APPLY_BACKUP=false`
+or `--skip-pre-apply-backup` is used. Zero-change runs skip that pre-apply backup
+because there are no writes to protect. After every successful apply, it
+immediately creates a rollback-readiness plan from the new per-write backups and
+checks every rollback draft for conflicts. If rollback readiness fails, the
+command exits nonzero so systemd/journald and the Codex review loop surface it.
+This can be disabled only by setting `DAILY_RUN_VERIFY_ROLLBACK_READINESS=false`
+or passing `--skip-rollback-readiness`.
 
 Set `DAILY_RUN_BACKUP_SYNC_COMMAND` to run an off-box backup sync after the
 pre-apply backup and after rollback-readiness planning. The command receives
@@ -54,6 +55,21 @@ fails rollback readiness. This is controlled by `DAILY_RUN_RECONCILE_ATTEMPTS`
 and `DAILY_RUN_RECONCILE_DELAY_MS`. Reconciliation never sends new `putRate`
 calls; it only re-reads Cloudbeds and updates the saved run/draft when the
 delayed readback verifies cleanly.
+
+The VPS default is `DAILY_RUN_RECONCILE_ATTEMPTS=12` with
+`DAILY_RUN_RECONCILE_DELAY_MS=60000`, allowing roughly twelve minutes for
+Cloudbeds readback lag before the daily run pauses for review.
+
+After late reconciliation, the daily runner can self-heal a narrow failed-chunk
+case instead of leaving the run paused forever. With
+`DAILY_RUN_AUTO_RETRY_FAILED_CHUNK=true`, it retries a failed chunk only when
+there is exactly one post-apply verification failure, all applied/failed chunks
+have backup ids, untouched-scope and adjacent-night verification are clean,
+adjacent suspicious count is zero, and the remaining mismatches are small
+whole-dollar targeted smoothing rows. The retry guard is capped by
+`DAILY_RUN_AUTO_RETRY_MAX_CHUNKS` and
+`DAILY_RUN_AUTO_RETRY_MAX_TARGETED_MISMATCHES`. Anything outside those guardrails
+still pauses and exits nonzero for review.
 
 For lower-risk live rollout, work from far-future dates back toward near-term
 dates. For example, this plans one night roughly a year out; tomorrow's scheduled

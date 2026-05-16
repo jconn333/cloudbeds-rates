@@ -52,6 +52,9 @@ function parseArgs(argv) {
     preApplyBackup: String(process.env.DAILY_RUN_PRE_APPLY_BACKUP ?? "true").toLowerCase() !== "false",
     reconcileAttempts: Number(process.env.DAILY_RUN_RECONCILE_ATTEMPTS ?? "6"),
     reconcileDelayMs: Number(process.env.DAILY_RUN_RECONCILE_DELAY_MS ?? "30000"),
+    autoRetryFailedChunk: String(process.env.DAILY_RUN_AUTO_RETRY_FAILED_CHUNK ?? "true").toLowerCase() !== "false",
+    autoRetryMaxChunks: Number(process.env.DAILY_RUN_AUTO_RETRY_MAX_CHUNKS ?? "2"),
+    autoRetryMaxTargetedMismatches: Number(process.env.DAILY_RUN_AUTO_RETRY_MAX_TARGETED_MISMATCHES ?? "3"),
     properties: [],
     startDate: process.env.DAILY_RUN_START_DATE ?? null,
     startOffsetDays:
@@ -117,6 +120,12 @@ function parseArgs(argv) {
   if (options.endDateLimit && !isIsoDate(options.endDateLimit)) {
     throw new Error("--end-date-limit must be YYYY-MM-DD.");
   }
+  if (!Number.isInteger(options.autoRetryMaxChunks) || options.autoRetryMaxChunks < 0) {
+    throw new Error("DAILY_RUN_AUTO_RETRY_MAX_CHUNKS must be a non-negative integer.");
+  }
+  if (!Number.isInteger(options.autoRetryMaxTargetedMismatches) || options.autoRetryMaxTargetedMismatches <= 0) {
+    throw new Error("DAILY_RUN_AUTO_RETRY_MAX_TARGETED_MISMATCHES must be a positive integer.");
+  }
 
   return options;
 }
@@ -143,6 +152,101 @@ function wait(ms) {
 
 function hasPostApplyVerificationFailure(run) {
   return run.chunks.some((chunk) => ["verification_failed", "partial_apply_failed"].includes(chunk.status));
+}
+
+function findPostApplyFailedChunk(run) {
+  return run.chunks.find((chunk) => ["verification_failed", "partial_apply_failed"].includes(chunk.status));
+}
+
+function isWholeDollar(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && Math.abs(numeric - Math.round(numeric)) < 0.001;
+}
+
+function verifiedCountMatches(summary, verifiedKey, countKey) {
+  const verified = Number(summary?.[verifiedKey] ?? 0);
+  const count = Number(summary?.[countKey] ?? 0);
+  return Number.isFinite(verified) && Number.isFinite(count) && verified === count;
+}
+
+async function assessSafeFailedChunkRetry(run, options) {
+  if (!options.autoRetryFailedChunk) {
+    return { safe: false, reason: "auto retry is disabled" };
+  }
+  if (run.status !== "paused") {
+    return { safe: false, reason: `run is ${run.status}, not paused` };
+  }
+
+  const failedChunks = run.chunks.filter((chunk) => ["verification_failed", "partial_apply_failed"].includes(chunk.status));
+  if (failedChunks.length !== 1) {
+    return { safe: false, reason: `expected exactly one failed post-apply chunk; found ${failedChunks.length}` };
+  }
+
+  const failedChunk = failedChunks[0];
+  if (!failedChunk.draftId || !failedChunk.backupId) {
+    return { safe: false, reason: `chunk ${failedChunk.sequence} is missing a draft or backup id` };
+  }
+
+  const missingAppliedBackups = run.chunks.filter(
+    (chunk) => ["applied", "verification_failed", "partial_apply_failed"].includes(chunk.status) && !chunk.backupId
+  );
+  if (missingAppliedBackups.length) {
+    return {
+      safe: false,
+      reason: `run has ${missingAppliedBackups.length} applied/failed chunk(s) without backup ids`,
+    };
+  }
+
+  const draft = await getDraft(failedChunk.draftId);
+  const summary = draft.verificationSummary;
+  const targetedMismatches = (draft.verification ?? []).filter((item) => !item.verified);
+  if (!summary || !targetedMismatches.length) {
+    return { safe: false, reason: `chunk ${failedChunk.sequence} has no targeted mismatch evidence` };
+  }
+  if (targetedMismatches.length > options.autoRetryMaxTargetedMismatches) {
+    return {
+      safe: false,
+      reason: `chunk ${failedChunk.sequence} has ${targetedMismatches.length} targeted mismatches, above limit ${options.autoRetryMaxTargetedMismatches}`,
+    };
+  }
+  if (!verifiedCountMatches(summary, "untouchedScopeVerifiedCount", "untouchedScopeCount")) {
+    return { safe: false, reason: `chunk ${failedChunk.sequence} has untouched-scope mismatches` };
+  }
+  if (!verifiedCountMatches(summary, "adjacentVerifiedCount", "adjacentCount")) {
+    return { safe: false, reason: `chunk ${failedChunk.sequence} has adjacent-night mismatches` };
+  }
+  if (Number(summary.adjacentSuspiciousCount ?? 0) !== 0) {
+    return { safe: false, reason: `chunk ${failedChunk.sequence} has suspicious adjacent spill evidence` };
+  }
+
+  const changeByKey = new Map((draft.changes ?? []).map((change) => [`${change.date}::${change.rateID}`, change]));
+  const unsafeMismatch = targetedMismatches.find((mismatch) => {
+    const change = changeByKey.get(`${mismatch.date}::${mismatch.rateID}`);
+    return !change || mismatch.actualRate === null || !isWholeDollar(change.proposedRate) || !isWholeDollar(mismatch.expectedRate);
+  });
+  if (unsafeMismatch) {
+    return {
+      safe: false,
+      reason: `chunk ${failedChunk.sequence} has a mismatch that is not a whole-dollar targeted smoothing row`,
+    };
+  }
+
+  return {
+    safe: true,
+    chunk: failedChunk,
+    mismatchCount: targetedMismatches.length,
+  };
+}
+
+function canResumeAfterSuccessfulReconcile(run) {
+  if (run.status !== "paused") return false;
+  const allowedStatuses = new Set(["applied", "skipped", "planned"]);
+  return (
+    run.chunks.some((chunk) => chunk.status === "planned") &&
+    run.chunks.some((chunk) => ["applied", "skipped"].includes(chunk.status)) &&
+    run.chunks.every((chunk) => allowedStatuses.has(chunk.status)) &&
+    !hasPostApplyVerificationFailure(run)
+  );
 }
 
 async function withLock(name, fn) {
@@ -302,10 +406,62 @@ async function reconcileAppliedRun(run, options) {
       console.log(`Late reconcile verified ${currentRun.id} on attempt ${attempt}.`);
       return currentRun;
     }
+    if (canResumeAfterSuccessfulReconcile(currentRun)) {
+      console.log(
+        `Late reconcile settled a paused chunk for ${currentRun.id} on attempt ${attempt}; resuming remaining planned chunks.`
+      );
+      currentRun = await applyRun(currentRun.id);
+      console.log(`Resumed run ${currentRun.id}: ${summarize(currentRun)}.`);
+      if (currentRun.status === "applied") return currentRun;
+      if (!hasPostApplyVerificationFailure(currentRun)) return currentRun;
+      continue;
+    }
     const message = currentRun.progress?.message ?? `${currentRun.id} remains ${currentRun.status}`;
     console.log(`Late reconcile attempt ${attempt}/${options.reconcileAttempts} did not verify ${currentRun.id}: ${message}`);
   }
   return currentRun;
+}
+
+async function settleRunAfterApply(run, options) {
+  let currentRun = run;
+  let autoRetries = 0;
+  const maxIterations = (currentRun.chunks?.length ?? 1) + options.autoRetryMaxChunks + 4;
+
+  for (let iteration = 0; iteration < maxIterations; iteration += 1) {
+    if (currentRun.status === "applied") return currentRun;
+
+    if (hasPostApplyVerificationFailure(currentRun)) {
+      currentRun = await reconcileAppliedRun(currentRun, options);
+      if (currentRun.status === "applied") return currentRun;
+    }
+
+    if (hasPostApplyVerificationFailure(currentRun)) {
+      if (autoRetries >= options.autoRetryMaxChunks) return currentRun;
+      const retryAssessment = await assessSafeFailedChunkRetry(currentRun, options);
+      if (!retryAssessment.safe) {
+        console.log(`Auto-retry not allowed for ${currentRun.id}: ${retryAssessment.reason}.`);
+        return currentRun;
+      }
+      autoRetries += 1;
+      console.log(
+        `Auto-retrying chunk ${retryAssessment.chunk.sequence} for ${currentRun.id}; ${retryAssessment.mismatchCount} targeted whole-dollar mismatch(es), backups present, adjacent checks clean.`
+      );
+      currentRun = await applyRun(currentRun.id, { mode: "retry_failed_chunk" });
+      console.log(`Auto-retry returned ${currentRun.id}: ${summarize(currentRun)}.`);
+      continue;
+    }
+
+    if (canResumeAfterSuccessfulReconcile(currentRun)) {
+      console.log(`Resuming remaining planned chunks for ${currentRun.id} after clean retry/reconcile state.`);
+      currentRun = await applyRun(currentRun.id);
+      console.log(`Resumed run ${currentRun.id}: ${summarize(currentRun)}.`);
+      continue;
+    }
+
+    return currentRun;
+  }
+
+  throw new Error(`Run ${currentRun.id} did not settle after ${maxIterations} repair/resume iteration(s).`);
 }
 
 async function findExistingRun(automationKey) {
@@ -358,17 +514,26 @@ async function runProperty(propertyKey, options) {
       console.log(`Run ${run.id} already applied; skipping.`);
       return { run, applied: false };
     }
-    if (run.status !== "planned") {
+    if (run.status !== "planned" && run.status !== "paused") {
       throw new Error(`Run ${run.id} is ${run.status}; refusing unattended apply.`);
     }
 
-    const preApplyBackup = options.preApplyBackup
+    const preApplyBackup = run.status === "planned" && run.totalChanges > 0 && options.preApplyBackup
       ? await createPreApplyBackup(property, startDate, endDate, options.operator, automationKey)
       : null;
-    let appliedRun = await applyRun(run.id);
-    console.log(`Applied run ${appliedRun.id}: ${summarize(appliedRun)}.`);
-    if (appliedRun.status !== "applied" && hasPostApplyVerificationFailure(appliedRun)) {
-      appliedRun = await reconcileAppliedRun(appliedRun, options);
+    let appliedRun;
+    if (run.status === "paused") {
+      console.log(`Attempting guarded unattended repair for paused run ${run.id}.`);
+      appliedRun = await settleRunAfterApply(run, options);
+    } else {
+      appliedRun = await applyRun(run.id);
+      console.log(`Applied run ${appliedRun.id}: ${summarize(appliedRun)}.`);
+      appliedRun = await settleRunAfterApply(appliedRun, options);
+    }
+    if (appliedRun.status !== "applied") {
+      const failedChunk = findPostApplyFailedChunk(appliedRun);
+      const detail = failedChunk ? ` Failed chunk ${failedChunk.sequence}: ${failedChunk.error ?? "verification did not settle"}` : "";
+      throw new Error(`Run ${appliedRun.id} is ${appliedRun.status} after guarded repair; refusing rollback readiness.${detail}`);
     }
     const rollbackReadiness = options.verifyRollbackReadiness
       ? await verifyRollbackReadiness(appliedRun, options.operator)

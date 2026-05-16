@@ -56,8 +56,11 @@ DAILY_RUN_DAYS_AHEAD=1
 DAILY_RUN_OPERATOR=digitalocean-daily
 DAILY_RUN_PRE_APPLY_BACKUP=true
 DAILY_RUN_VERIFY_ROLLBACK_READINESS=true
-DAILY_RUN_RECONCILE_ATTEMPTS=6
-DAILY_RUN_RECONCILE_DELAY_MS=30000
+DAILY_RUN_RECONCILE_ATTEMPTS=12
+DAILY_RUN_RECONCILE_DELAY_MS=60000
+DAILY_RUN_AUTO_RETRY_FAILED_CHUNK=true
+DAILY_RUN_AUTO_RETRY_MAX_CHUNKS=2
+DAILY_RUN_AUTO_RETRY_MAX_TARGETED_MISMATCHES=3
 DAILY_RUN_LOCK_STALE_MINUTES=240
 APPLY_LOCK_STALE_MINUTES=240
 RECONCILE_RETRY_ATTEMPTS=1
@@ -91,6 +94,14 @@ rollback-readiness planning.
 Cloudbeds readback lag after completed jobs. The runner rechecks failed
 post-apply verification chunks without rewriting before it treats the run as
 failed.
+
+`DAILY_RUN_AUTO_RETRY_FAILED_CHUNK=true` lets the VPS repair the same narrow
+case we otherwise handle manually: one failed post-apply chunk, backups present,
+untouched and adjacent verification clean, zero suspicious adjacent spill rows,
+and only a small number of whole-dollar targeted smoothing mismatches. The caps
+are `DAILY_RUN_AUTO_RETRY_MAX_CHUNKS` and
+`DAILY_RUN_AUTO_RETRY_MAX_TARGETED_MISMATCHES`; outside that envelope, the run
+still pauses and reports loudly.
 
 ## Install services
 

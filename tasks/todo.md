@@ -1,5 +1,56 @@
 # Task Notes
 
+## 2026-05-16 Daily runner self-healing for safe failed chunks
+
+- [x] Review the current late-reconcile and retry-failed-chunk paths.
+- [x] Add a guarded daily-run auto-retry path for known-safe failed chunks.
+- [x] Skip full pre-apply backup work when a planned daily run has zero changes.
+- [x] Verify syntax/preflight locally.
+- [x] Deploy the updated runner to the VPS and verify timer/service state.
+
+Requirement: The daily runner may retry a failed chunk only when backups exist, untouched/adjacent verification is clean, suspicious adjacent spill count is zero, and the remaining mismatch is a small targeted whole-dollar smoothing mismatch. Anything outside that envelope should still pause and notify.
+
+Result: Added daily-run self-healing for one safe failed post-apply chunk after late reconciliation. The runner now retries only within the backup/verification/whole-dollar guardrails, resumes remaining planned chunks when the retry settles, and refuses rollback readiness unless the run reaches `applied`. Also skipped pre-apply backup creation for zero-change planned runs. Verified local `node --check`, `node scripts/daily-run.mjs --help`, and `npm run preflight`. Backed up the VPS runner/env to timestamp `20260516101528`, deployed `/opt/cloudbeds-rates/scripts/daily-run.mjs`, set explicit auto-retry env knobs, and verified remote syntax/help plus active timer for `2026-05-17 10:01:54 EDT`.
+
+## 2026-05-16 Resolve May 15 Berlin Resort paused row
+
+- [x] Stop the daily timer briefly to avoid overlap with the unresolved paused Resort run.
+- [x] Retry the failed chunk for `run_20260515142724_7fcbb8b1`.
+- [x] Resume the remaining planned Resort chunks.
+- [x] Generate rollback-readiness plan and verify backups/adjacent checks.
+- [x] Reactivate the daily timer.
+
+Result: Repaired the May 15 Berlin Resort pause on `Signature Suite ADA - 402` for `2026-10-19` by retrying the failed chunk, then resumed the remaining chunks. Run `run_20260515142724_7fcbb8b1` is now `applied` with 20/20 chunks, no missing backups, all verification clean, adjacent suspicious count 0, and rollback-readiness run `run_20260516135410_210b2f38` has 0 conflicts. Timer was reactivated for the May 16 scheduled pass.
+
+## 2026-05-14 Increase Cloudbeds readback lag tolerance
+
+- [x] Back up the VPS env before changing reconcile settings.
+- [x] Increase daily readback-only reconcile window to 12 attempts with 60s delay.
+- [x] Clear stale systemd failed state without starting a new run.
+- [x] Update repo docs/examples to match the live VPS setting.
+
+Result: Backed up `/etc/cloudbeds-rates.env` to `/etc/cloudbeds-rates.env.20260514115226.bak`, set `DAILY_RUN_RECONCILE_ATTEMPTS=12` and `DAILY_RUN_RECONCILE_DELAY_MS=60000`, and verified the timer remains active for `2026-05-15 10:03:38 EDT`. No Cloudbeds writes were triggered.
+
+## 2026-05-13 Daily runner auto-resume after successful late reconcile
+
+- [x] Diagnose why the May 13 daily run paused even after late reconcile verified the failed chunk.
+- [x] Add daily-run logic to resume remaining planned chunks when a paused run contains only applied/skipped/planned chunks after successful reconcile.
+- [x] Verify syntax and CLI load behavior locally.
+- [x] Deploy the updated daily runner to the VPS.
+
+Result: Added a narrow auto-resume path to `scripts/daily-run.mjs`: after late reconcile, if the run is paused with only applied/skipped/planned chunks and no remaining verification failure, the daily runner calls `applyRun` again to continue the remaining planned chunks before attempting rollback readiness. Verified local `node --check` and `--help`; backed up the VPS runner to `/opt/cloudbeds-rates/scripts/daily-run.mjs.20260513151038.bak`, deployed the updated runner, and verified remote `node --check` plus `--help`. The timer remains active for `2026-05-14 10:01:42 EDT`.
+
+## 2026-05-12 Expand live daily window to rolling 365 nights
+
+- [x] Confirm daily runner date-window semantics.
+- [x] Back up the current VPS environment file before changing live config.
+- [x] Change the daily live window to start at today's date and cover 365 inclusive nights.
+- [x] Verify the effective VPS config and next timer run.
+
+Result: VPS `/etc/cloudbeds-rates.env` was backed up to `/etc/cloudbeds-rates.env.20260512152609.bak`. The live daily window now uses `DAILY_RUN_START_OFFSET_DAYS=0` and `DAILY_RUN_DAYS_AHEAD=365`, with the fixed `DAILY_RUN_START_DATE` removed. At the time of change on 2026-05-12, that resolves to `2026-05-12..2027-05-11`; future timer runs roll forward from that day's date. The app service is active, writes remain enabled, and `cloudbeds-rates-daily.timer` remains active/enabled with next run `2026-05-13 10:04:06 EDT`.
+
+Manual apply result: Started `cloudbeds-rates-daily.service` manually on 2026-05-12. Berlin Encore run `run_20260512193516_1a9fa125` applied 573 changes across 20 chunks after full pre-apply backup `backup_20260512193822_cde9db2b` with 3650 base rows. Berlin Resort run `run_20260512200614_2e473163` applied 441 changes across 11 chunks after full pre-apply backup `backup_20260512200919_55d86ed9` with 7665 base rows. Both runs passed targeted, untouched-scope, and adjacent verification with 0 suspicious adjacent rows, and both rollback-readiness plans had 0 conflicts.
+
 ## 2026-05-11 Aggressive live smoothing window June 2026-February 2027
 
 - [x] Confirm current VPS write gates, run limits, and property scope.
