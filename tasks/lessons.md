@@ -57,3 +57,5 @@
 - Zero-change daily runs do not need full pre-apply backups because no Cloudbeds writes will occur; skipping those backups avoids hundreds of unnecessary read calls and shortens no-op days.
 
 - Skipped-only applied runs also do not have rollback-source chunk backups even when `totalChanges` is greater than zero. Rollback readiness should be required only when at least one chunk actually wrote rates and has a backup; stale unsafe paused runs should be archived as metadata, not deleted or retried, once later daily windows supersede them.
+
+- On the VPS, run the daily-run CLI as the service user (`sudo -u cloudbeds-rates`), never as root: writeJson creates files with mode 600, so root-created run/draft/backup files are unreadable by the service and crash the next timer run at listRuns. If it happens, `chown -R cloudbeds-rates:cloudbeds-rates /opt/cloudbeds-rates/data` repairs it.
