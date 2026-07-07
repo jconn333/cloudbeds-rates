@@ -158,6 +158,8 @@ function summarizeRunEvent(event) {
       return `Rollback run planned from ${payload.sourceRunId ?? "source run"} with ${payload.chunkCount ?? 0} chunk(s).`;
     case "spill_correction_draft_created":
       return `Created spill repair draft with ${payload.changeCount ?? 0} row(s).`;
+    case "run_archived":
+      return `Archived from ${payload.archivedFromStatus ?? "previous"} status${payload.reason ? `: ${payload.reason}` : "."}`;
     default:
       return payload.error ?? event.type;
   }
@@ -189,6 +191,18 @@ async function api(path, options = {}) {
   const json = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(json.error ?? `Request failed (${response.status})`);
   return json;
+}
+
+async function refreshAfterWrite({ rates = false } = {}) {
+  try {
+    await loadRuns();
+    await loadDrafts();
+    await loadBackups();
+    await loadAudit();
+    if (rates) await fetchRates();
+  } catch {
+    setMessage("Applied successfully, but refreshing lists failed — reload the page to see latest state.", "");
+  }
 }
 
 function renderConfig() {
@@ -223,6 +237,18 @@ function currentProperty() {
 
 function selectedPropertyKey() {
   return currentProperty().key;
+}
+
+function selectedRule() {
+  return $("ruleSelect")?.value === "round49" ? "round49" : "truncate";
+}
+
+function ruleStringForOption(ruleOption) {
+  return ruleOption === "round49" ? "round to 4/9 endings" : "truncate cents to .00";
+}
+
+function ruleLabel(rule) {
+  return String(rule ?? "").includes("4/9") ? "4/9 endings" : "truncate cents";
 }
 
 function rateStatus(row) {
@@ -422,7 +448,7 @@ function renderRates() {
 
   const summary = summarizeRates(state.rates);
   const targetCount = summary.changedRows.length;
-  const nights = inclusiveNightCount($("startDate").value, $("endDate").value || $("startDate").value);
+  const nights = inclusiveNightCount($("startDate").value, $("endDate").value || tomorrow($("startDate").value));
   const limits = state.config?.limits ?? { maxDraftDays: 1, maxDraftChanges: 20, maxRunDays: 45 };
   $("createRun").disabled = targetCount === 0 || nights > limits.maxRunDays;
   renderRateSummary(summary, targetCount, nights, limits);
@@ -527,6 +553,7 @@ function renderAudit(events) {
 function renderRunDetail(run) {
   state.latestRun = run;
   $("selectedRunState").textContent = `${run.status} · ${run.id}`;
+  const isArchived = run.status === "archived" || Boolean(run.archivedAt);
   const appliedChunks = run.chunks.filter((chunk) => chunk.status === "applied").length;
   const skippedChunks = run.chunks.filter((chunk) => chunk.status === "skipped").length;
   const failedChunks = run.chunks.filter((chunk) =>
@@ -545,6 +572,7 @@ function renderRunDetail(run) {
     }));
   const primaryFailure = chunkFailures[0] ?? null;
   const canCreateSpillRepairDraft =
+    !isArchived &&
     run.type === "smooth" &&
     (spillSuspectedChunks > 0 || appliedChunks > 0) &&
     run.status !== "running";
@@ -624,11 +652,12 @@ function renderRunDetail(run) {
     )
     .join("");
 
-  const resumable = ["planned", "running", "paused", "verification_failed", "apply_failed", "partial_apply_failed"].includes(run.status);
-  const canRollback = !run.readinessOnly && run.type === "smooth" && appliedChunks > 0;
-  const primaryAction = runPrimaryAction(run, failedChunks, appliedChunks);
-  const canRetryFailedChunk = !run.readinessOnly && failedChunks > 0 && state.config.writesEnabled;
-  const canReconcile = !run.readinessOnly && failedChunks > 0;
+  const resumable =
+    !isArchived && ["planned", "running", "paused", "verification_failed", "apply_failed", "partial_apply_failed"].includes(run.status);
+  const canRollback = !isArchived && !run.readinessOnly && run.type === "smooth" && appliedChunks > 0;
+  const primaryAction = isArchived ? null : runPrimaryAction(run, failedChunks, appliedChunks);
+  const canRetryFailedChunk = !isArchived && !run.readinessOnly && failedChunks > 0 && state.config.writesEnabled;
+  const canReconcile = !isArchived && !run.readinessOnly && failedChunks > 0;
   $("runDetail").className = "draft-detail";
   $("runDetail").innerHTML = `
     <div class="summary-grid">
@@ -639,6 +668,8 @@ function renderRunDetail(run) {
       <div class="metric"><span>Verified</span><strong>${totalVerified}/${run.totalChanges}</strong></div>
       <div class="metric"><span>Skipped</span><strong>${skippedChunks}</strong></div>
       <div class="metric"><span>Phase</span><strong>${escapeHtml(progress.phase ?? run.status)}</strong></div>
+      ${run.rule ? `<div class="metric"><span>Rule</span><strong>${escapeHtml(ruleLabel(run.rule))}</strong></div>` : ""}
+      ${isArchived ? `<div class="metric"><span>Archived</span><strong>${escapeHtml(formatDateTime(run.archivedAt))}</strong></div>` : ""}
     </div>
     ${runAlert || ""}
     <div class="run-notes">
@@ -965,6 +996,7 @@ async function fetchRates() {
         propertyKey: selectedPropertyKey(),
         startDate: night,
         endDate: night,
+        rule: selectedRule(),
       });
       const json = await api(`/api/rates?${params}`);
       rows.push(...json.rows);
@@ -1008,7 +1040,15 @@ async function createRun() {
   setMessage("Planning large-batch run and chunk boundaries...");
   const json = await api("/api/runs", {
     method: "POST",
-    body: JSON.stringify({ propertyKey: selectedPropertyKey(), startDate, endDate, operator: "web-app", notes: $("notes").value, type: "smooth" }),
+    body: JSON.stringify({
+      propertyKey: selectedPropertyKey(),
+      startDate,
+      endDate,
+      operator: "web-app",
+      notes: $("notes").value,
+      type: "smooth",
+      rule: ruleStringForOption(selectedRule()),
+    }),
   });
   const events = await api(`/api/runs/${json.run.id}/events?limit=20`);
   state.latestRunEvents = events.events;
@@ -1141,11 +1181,7 @@ async function applySelectedRun() {
       detail: describeRunProgress(json.run),
       percent: runProgressPercent(json.run),
     });
-    await loadRuns();
-    await loadDrafts();
-    await loadBackups();
-    await loadAudit();
-    await fetchRates();
+    await refreshAfterWrite({ rates: true });
     const ok = json.run.status === "applied";
     setMessage(ok ? "Run completed with chunk-level backups and verification." : `Run paused with status ${json.run.status}. Review the run detail.`, ok ? "good" : "error");
   } catch (error) {
@@ -1205,11 +1241,7 @@ async function retryFailedChunk() {
       detail: describeRunProgress(json.run),
       percent: runProgressPercent(json.run),
     });
-    await loadRuns();
-    await loadDrafts();
-    await loadBackups();
-    await loadAudit();
-    await fetchRates();
+    await refreshAfterWrite({ rates: true });
     setMessage(json.run.status === "applied" ? "Failed chunk retry completed and the run is now applied." : `Retry finished with status ${json.run.status}. Review the run detail.`, json.run.status === "applied" ? "good" : "error");
   } catch (error) {
     setMessage(error.message, "error");
@@ -1324,9 +1356,7 @@ async function applySelectedDraft() {
       body: JSON.stringify({ confirmation: "yes" }),
     });
     renderDraftDetail(json.draft);
-    await loadDrafts();
-    await loadAudit();
-    await fetchRates();
+    await refreshAfterWrite({ rates: true });
     const ok = json.draft.verification.every((item) => item.verified);
     setMessage(
       ok ? "Draft applied and verified. Readback is shown in the selected draft." : "Draft applied with readback mismatches. Review the selected draft result.",

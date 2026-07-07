@@ -152,9 +152,13 @@ and add named aliases such as `CLOUDBEDS_BERLIN_ENCORE_*` and
 - Applies are capped by `MAX_APPLY_CHANGES` (default: 100 changes).
 - Proposed write rates must stay between `MIN_ALLOWED_RATE` and `MAX_ALLOWED_RATE` (defaults: $1.00-$999.99).
 - Smooth drafts may only remove cents and cannot decrease any rate by more than `MAX_SMOOTH_RATE_DECREASE` (default: $0.99).
+- Parity corrections may move an ADA room to match its source room but are capped by `MAX_PARITY_RATE_DELTA` (default $25); larger divergences pause for review.
+- An opt-in `round to 4/9 endings` rule rounds base rates to the nearest whole dollar ending in 4 or 9, using the same `roundTo49` formula as pricey-pro's engine.js, with a hard `MIN_ROOM_RATE_FLOOR` floor (default $89). Non-floor moves are capped by `MAX_ROUND_RATE_DELTA` (default $2.50); rates below the floor may only move up to the floor value. The rule is chosen per run/preview (`rule=truncate|round49` on `/api/rates` and `/api/parity-audit`, or the UI rule select) and is never hardcoded to a property. The default `truncate cents` rule is unaffected.
 - Large-batch runs can plan up to `MAX_RUN_DAYS` nights and split work into `RUN_CHUNK_MAX_NIGHTS` / `RUN_CHUNK_MAX_CHANGES` chunks.
 - Every run chunk creates its own draft and backup before writing.
 - Daily live applies create a full-scope pre-apply backup before writing.
+- The daily runner's smoothing rule is controlled by `DAILY_RUN_RULE` (`truncate` default, or `round49`) or `--rule`; switching rules mid-day plans a distinct run instead of resuming one planned under the other rule.
+- `DAILY_RUN_NOTIFY_ON_SUCCESS` (default `true`) can be set to `false` to skip the webhook notification for fully successful runs while still notifying on any failure; the webhook payload (`{"text": "..."}`) is Slack-incoming-webhook compatible.
 - Daily runs can call `DAILY_RUN_BACKUP_SYNC_COMMAND` to copy state off the VPS.
 - Rollback runs are generated from the per-chunk backups of a prior run.
 - Every apply polls `getRateJobs` and re-reads Cloudbeds rates for verification.

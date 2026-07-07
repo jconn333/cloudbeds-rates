@@ -32,6 +32,9 @@ const RUN_CHUNK_MAX_NIGHTS = Number(process.env.RUN_CHUNK_MAX_NIGHTS ?? "7");
 const MIN_ALLOWED_RATE = Number(process.env.MIN_ALLOWED_RATE ?? "1");
 const MAX_ALLOWED_RATE = Number(process.env.MAX_ALLOWED_RATE ?? "999.99");
 const MAX_SMOOTH_RATE_DECREASE = Number(process.env.MAX_SMOOTH_RATE_DECREASE ?? "0.99");
+const MAX_PARITY_RATE_DELTA = Number(process.env.MAX_PARITY_RATE_DELTA ?? "25");
+const MIN_ROOM_RATE_FLOOR = Number(process.env.MIN_ROOM_RATE_FLOOR ?? "89");
+const MAX_ROUND_RATE_DELTA = Number(process.env.MAX_ROUND_RATE_DELTA ?? "2.5");
 const VERIFY_RETRY_ATTEMPTS = Number(process.env.VERIFY_RETRY_ATTEMPTS ?? "4");
 const VERIFY_RETRY_DELAY_MS = Number(process.env.VERIFY_RETRY_DELAY_MS ?? "3000");
 const RECONCILE_RETRY_ATTEMPTS = Number(process.env.RECONCILE_RETRY_ATTEMPTS ?? "1");
@@ -56,6 +59,11 @@ const ROOM_RATE_PARITY_GROUPS = [
     key: "two-queen-deluxe-standard-ada",
     sourceNames: ["2 Queen Deluxe", "Two Queen Deluxe", "2 Queen Deluxe Standard", "Two Queen Deluxe Standard"],
     matchNames: ["2 Queen Deluxe ADA", "Two Queen Deluxe ADA"],
+  },
+  {
+    key: "encore-suite-standard-accessible",
+    sourceNames: ["Encore Suite", "1 King Encore Suite"],
+    matchNames: ["Encore Suite Accessible", "Encore Suite ADA"],
   },
 ];
 
@@ -145,10 +153,6 @@ function requireConfig(property = resolveDefaultProperty()) {
 
 function isoNow() {
   return new Date().toISOString();
-}
-
-function stableJson(value) {
-  return JSON.stringify(value, Object.keys(value).sort());
 }
 
 function buildDraftPayload({
@@ -270,8 +274,17 @@ function maxDate(values) {
   return [...values].sort().at(-1) ?? null;
 }
 
+const RULE_TRUNCATE = "truncate cents to .00";
+const RULE_ROUND49 = "round to 4/9 endings";
+
 function smoothRate(rate) {
   return Number(Math.trunc(Number(rate)).toFixed(2));
+}
+
+// Round to the nearest price ending in 4 or 9 (endings sit 5 apart, so this
+// is "nearest multiple of 5, shifted by 4"). Mirrors pricey-pro's engine.js.
+function roundTo49(n) {
+  return Math.round((n - 4) / 5) * 5 + 4;
 }
 
 function money(value) {
@@ -286,8 +299,22 @@ function changeIdentity(change) {
   return `${change.date ?? change.startDate ?? "unknown date"} ${change.roomTypeName ?? "unknown room"} ${change.rateID ?? ""}`.trim();
 }
 
+function ruleKind(rule) {
+  const text = String(rule ?? "").toLowerCase();
+  if (text.includes("truncate cents")) return "truncate";
+  if (text.includes("4/9")) return "round49";
+  return null;
+}
+
 function isSmoothRule(rule) {
-  return String(rule ?? "").toLowerCase().includes("truncate cents");
+  return ruleKind(rule) !== null;
+}
+
+function targetRateForRule(rate, rule) {
+  if (ruleKind(rule) === "round49") {
+    return Math.max(roundTo49(Math.round(Number(rate))), MIN_ROOM_RATE_FLOOR);
+  }
+  return smoothRate(rate);
 }
 
 function normalizedRoomName(value) {
@@ -319,7 +346,18 @@ function findRoomByNames(rows, names) {
   return rows.find((row) => wanted.has(normalizedRoomName(row.roomTypeName)));
 }
 
+function isWholeDollarRate(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && Math.abs(numeric - Math.round(numeric)) < 0.001;
+}
+
+function endsIn49(value) {
+  const lastDigit = Math.round(Number(value)) % 10;
+  return lastDigit === 4 || lastDigit === 9;
+}
+
 function assertSafeRateChanges(changes, { rule = "" } = {}) {
+  const kind = ruleKind(rule);
   for (const change of changes) {
     const proposedRate = Number(change.proposedRate);
     if (!Number.isFinite(proposedRate)) {
@@ -331,13 +369,53 @@ function assertSafeRateChanges(changes, { rule = "" } = {}) {
       );
     }
 
-    if (!isSmoothRule(rule)) continue;
-    if (change.parityGroupKey) continue;
+    if (kind === null) continue;
+
+    const isParityMatch = change.parityGroupKey && change.parityRole === "match";
+
+    if (isParityMatch) {
+      const currentRate = Number(change.currentRate);
+      if (!Number.isFinite(currentRate)) {
+        throw new Error(`Unsafe parity change for ${changeIdentity(change)}: current rate is not a finite number.`);
+      }
+      const delta = Math.abs(money(proposedRate) - money(currentRate));
+      if (delta > MAX_PARITY_RATE_DELTA + 0.005) {
+        throw new Error(
+          `Unsafe parity change for ${changeIdentity(change)}: delta $${delta.toFixed(2)} exceeds parity cap $${MAX_PARITY_RATE_DELTA.toFixed(2)}. Review manually.`
+        );
+      }
+      continue;
+    }
 
     const currentRate = Number(change.currentRate);
     if (!Number.isFinite(currentRate)) {
       throw new Error(`Unsafe smooth change for ${changeIdentity(change)}: current rate is not a finite number.`);
     }
+
+    if (kind === "round49") {
+      if (!isWholeDollarRate(proposedRate) || !(endsIn49(proposedRate) || money(proposedRate) === MIN_ROOM_RATE_FLOOR)) {
+        throw new Error(
+          `Unsafe round49 change for ${changeIdentity(change)}: proposed $${money(proposedRate).toFixed(2)} must be a whole dollar ending in 4 or 9, or the $${MIN_ROOM_RATE_FLOOR.toFixed(2)} floor.`
+        );
+      }
+      if (money(currentRate) >= MIN_ROOM_RATE_FLOOR) {
+        const delta = Math.abs(money(proposedRate) - money(currentRate));
+        if (delta > MAX_ROUND_RATE_DELTA + 0.005) {
+          throw new Error(
+            `Unsafe round49 change for ${changeIdentity(change)}: delta $${delta.toFixed(2)} exceeds $${MAX_ROUND_RATE_DELTA.toFixed(2)}.`
+          );
+        }
+      } else {
+        const floorTarget = Math.max(roundTo49(Math.round(currentRate)), MIN_ROOM_RATE_FLOOR);
+        if (money(proposedRate) !== money(floorTarget)) {
+          throw new Error(
+            `Unsafe round49 change for ${changeIdentity(change)}: current $${money(currentRate).toFixed(2)} is below the floor, so proposed must equal $${money(floorTarget).toFixed(2)}.`
+          );
+        }
+      }
+      continue;
+    }
+
     const decrease = money(currentRate) - money(proposedRate);
     if (decrease < -0.005) {
       throw new Error(
@@ -547,12 +625,17 @@ async function cloudbeds(method, params = {}, init = {}, propertyContext = resol
     }
 
     const text = await response.text();
-    const json = text ? JSON.parse(text) : {};
-    const message = json.message ?? json.error ?? `Cloudbeds HTTP ${response.status}`;
+    let json;
+    try {
+      json = text ? JSON.parse(text) : {};
+    } catch {
+      json = {};
+    }
+    const message = json.message ?? json.error ?? `Cloudbeds HTTP ${response.status}: ${text.slice(0, 200).trim()}`;
     const rateLimited = response.status === 429 || /rate limit/i.test(String(message));
 
     if (response.ok && json.success !== false) return json;
-    if (requestMethod === "GET" && rateLimited && attempt < 4) {
+    if ((requestMethod === "GET" || (requestMethod === "POST" && response.status === 429)) && rateLimited && attempt < 4) {
       await wait(1000 * 2 ** attempt);
       continue;
     }
@@ -619,12 +702,12 @@ function targetRowsForDraft(rows) {
   return rows.filter((row) => !row.isDerived && !row.ratePlanID && !row.ratePlanNamePublic);
 }
 
-function plannedChangesFromRows(rows) {
+function plannedChangesFromRows(rows, rule = RULE_TRUNCATE) {
   const baseRows = targetRowsForDraft(rows);
   const changesByKey = new Map();
 
   for (const row of baseRows) {
-    const change = makePlannedChange(row, smoothRate(row.currentRate));
+    const change = makePlannedChange(row, targetRateForRule(row.currentRate, rule));
     if (change.changed) changesByKey.set(changeKey(change), change);
   }
 
@@ -641,7 +724,7 @@ function plannedChangesFromRows(rows) {
       const match = findRoomByNames(dateRows, group.matchNames);
       if (!source || !match) continue;
 
-      const sourceProposedRate = smoothRate(source.currentRate);
+      const sourceProposedRate = targetRateForRule(source.currentRate, rule);
       const sourceChange = makePlannedChange(source, sourceProposedRate, {
         parityGroupKey: group.key,
         parityRole: "source",
@@ -663,7 +746,7 @@ function plannedChangesFromRows(rows) {
   );
 }
 
-function buildParityAudit(rows) {
+function buildParityAudit(rows, rule = RULE_TRUNCATE) {
   const baseRows = targetRowsForDraft(rows);
   const rowsByDate = new Map();
   for (const row of baseRows) {
@@ -688,7 +771,7 @@ function buildParityAudit(rows) {
         continue;
       }
 
-      const expectedRate = smoothRate(source.currentRate);
+      const expectedRate = targetRateForRule(source.currentRate, rule);
       const actualParityMismatch = !ratesEqual(match.currentRate, source.currentRate);
       const sourceNeedsSmoothing = !ratesEqual(source.currentRate, expectedRate);
       const matchNeedsCorrection = !ratesEqual(match.currentRate, expectedRate);
@@ -737,7 +820,7 @@ function buildTargetedDateSet(changes = []) {
   return new Set(changes.map((change) => change.date ?? change.startDate).filter(Boolean));
 }
 
-function buildBaseRowsSnapshot(rows, changes = []) {
+function buildBaseRowsSnapshot(rows, changes = [], rule = RULE_TRUNCATE) {
   const proposedByKey = new Map(
     changes.map((change) => [`${change.date ?? change.startDate}::${change.rateID}`, change.proposedRate])
   );
@@ -749,9 +832,9 @@ function buildBaseRowsSnapshot(rows, changes = []) {
     roomTypeID: row.roomTypeID,
     roomTypeName: row.roomTypeName,
     currentRate: row.currentRate,
-    proposedRate: proposedByKey.get(`${row.date}::${row.rateID}`) ?? smoothRate(row.currentRate),
+    proposedRate: proposedByKey.get(`${row.date}::${row.rateID}`) ?? targetRateForRule(row.currentRate, rule),
     targeted: proposedByKey.has(`${row.date}::${row.rateID}`),
-    alreadySmooth: smoothRate(row.currentRate) === row.currentRate,
+    alreadySmooth: targetRateForRule(row.currentRate, rule) === row.currentRate,
   }));
 }
 
@@ -775,7 +858,7 @@ async function createDraftRecord({
   endDate,
   operator = "local",
   notes = "",
-  rule = "truncate cents to .00",
+  rule = RULE_TRUNCATE,
   changes,
   normalizedRows,
   rawCloudbedsResponse,
@@ -828,7 +911,7 @@ async function createDraftRecord({
     rawCloudbedsResponse,
     safetyMetadata: SAFETY_METADATA,
     normalizedRows,
-    baseRowsSnapshot: buildBaseRowsSnapshot(normalizedRows, changes),
+    baseRowsSnapshot: buildBaseRowsSnapshot(normalizedRows, changes, rule),
     adjacentRowsSnapshot: buildAdjacentRowsSnapshot(adjacentRows),
     rollbackChanges: normalizeRollbackChanges(changes),
   };
@@ -857,14 +940,21 @@ async function createDraftRecord({
   return { draft, backup };
 }
 
-async function createDraft({ propertyKey = DEFAULT_PROPERTY_KEY, startDate, endDate, operator = "local", notes = "" }) {
+async function createDraft({
+  propertyKey = DEFAULT_PROPERTY_KEY,
+  startDate,
+  endDate,
+  operator = "local",
+  notes = "",
+  rule = RULE_TRUNCATE,
+}) {
   assertDate(startDate, "startDate");
   assertDate(endDate, "endDate");
   assertBatchScope(startDate, endDate, "Draft");
 
   const property = resolveProperty(propertyKey);
   const fetched = await fetchRatePlans(startDate, endDate, property);
-  const changes = plannedChangesFromRows(fetched.rows);
+  const changes = plannedChangesFromRows(fetched.rows, rule);
   const adjacentRows = await fetchBaseRowsForDates(buildAdjacentRiskDates(changes), property);
   const { draft } = await createDraftRecord({
     propertyKey: property.key,
@@ -874,6 +964,7 @@ async function createDraft({ propertyKey = DEFAULT_PROPERTY_KEY, startDate, endD
     endDate,
     operator,
     notes,
+    rule,
     changes,
     normalizedRows: fetched.rows,
     rawCloudbedsResponse: fetched.raw,
@@ -1041,15 +1132,21 @@ function summarizeRun(run) {
     failedChunks,
     totalChanges: run.totalChanges,
     totalVerified,
+    archived: Boolean(run.archivedAt),
+    archivedAt: run.archivedAt ?? null,
+    archivedReason: run.archivedReason ?? null,
     progress: run.progress ?? null,
   };
 }
 
-async function listRuns() {
+async function listRuns({ includeArchived = false } = {}) {
   await ensureDataDirs();
   const files = await fs.readdir(RUNS_DIR).catch(() => []);
   const runs = await Promise.all(files.filter((file) => file.endsWith(".json")).map((file) => readJson(path.join(RUNS_DIR, file))));
-  return runs.map(summarizeRun).sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  return runs
+    .filter((run) => includeArchived || !run.archivedAt)
+    .map(summarizeRun)
+    .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
 }
 
 async function getRun(id) {
@@ -1061,6 +1158,38 @@ async function saveRun(run) {
   await writeJson(path.join(RUNS_DIR, `${run.id}.json`), run);
 }
 
+async function archiveRun(id, { operator = "web-app", reason = "" } = {}) {
+  const run = await getRun(id);
+  if (run.archivedAt) return run;
+  if (run.status === "running") throw new Error("Cannot archive a running run.");
+  const archivedAt = isoNow();
+  run.archivedAt = archivedAt;
+  run.archivedBy = operator;
+  run.archivedReason = reason;
+  run.archivedFromStatus = run.status;
+  run.status = "archived";
+  updateRunProgress(run, {
+    phase: "archived",
+    activeChunkSequence: null,
+    message: reason ? `Archived: ${reason}` : "Archived from active run list.",
+  });
+  await saveRun(run);
+  auditEvent({
+    type: "run_archived",
+    operator,
+    entityType: "run",
+    entityId: run.id,
+    propertyId: run.propertyId,
+    startDate: run.startDate,
+    endDate: run.endDate,
+    payload: {
+      archivedFromStatus: run.archivedFromStatus,
+      reason,
+    },
+  });
+  return run;
+}
+
 async function createRun({
   propertyKey = DEFAULT_PROPERTY_KEY,
   startDate,
@@ -1069,15 +1198,17 @@ async function createRun({
   notes = "",
   type = "smooth",
   automationKey = null,
+  rule = RULE_TRUNCATE,
 }) {
   await initializeStorage();
   assertDate(startDate, "startDate");
   assertDate(endDate, "endDate");
   if (type !== "smooth") throw new Error(`Unsupported run type "${type}".`);
+  if (ruleKind(rule) === null) throw new Error(`Unsupported run rule "${rule}".`);
   assertRunScope(startDate, endDate);
   const property = resolveProperty(propertyKey);
   const fetched = await fetchRatePlans(startDate, endDate, property);
-  const changes = plannedChangesFromRows(fetched.rows);
+  const changes = plannedChangesFromRows(fetched.rows, rule);
   const chunks = chunkChangesForRun(changes).map((chunk, index) => ({
     ...chunk,
     sequence: index + 1,
@@ -1090,6 +1221,7 @@ async function createRun({
     propertyId: property.propertyId,
     propertyName: property.propertyName,
     automationKey,
+    rule,
     startDate,
     endDate,
     operator,
@@ -1695,6 +1827,7 @@ async function applyDraft(id, confirmation, options = {}) {
         appliedAt: draft.appliedAt ?? null,
         partialApply: { submittedJobs: jobs.length, expectedJobs: draft.changes.length },
       });
+      if (draft.changes.length > 1) await wait(250);
     } catch (error) {
       writeError = error;
       break;
@@ -1845,7 +1978,7 @@ async function draftFromRunChunk(run, chunk, options = {}) {
     endDate,
     operator: run.operator,
     notes: run.notes,
-    rule: run.type === "rollback" ? `rollback for ${run.sourceRunId ?? run.id}` : "truncate cents to .00",
+    rule: run.type === "rollback" ? `rollback for ${run.sourceRunId ?? run.id}` : run.rule ?? RULE_TRUNCATE,
     changes: chunk.changes,
     normalizedRows,
     rawCloudbedsResponse,
@@ -2050,13 +2183,21 @@ async function assessChunkLiveState(run, chunk) {
   const property = resolveProperty(run.propertyKey ?? run.propertyId);
   const fetched = await fetchRatePlans(chunk.startDate, chunk.endDate, property);
   const adjacentRows = await fetchBaseRowsForDates(buildAdjacentRiskDates(chunk.changes), property);
-  const freshChanges = plannedChangesFromRows(fetched.rows);
+  const chunkDates = new Set(chunk.changes.map((change) => change.date));
+  const freshChanges = plannedChangesFromRows(fetched.rows, run.rule ?? RULE_TRUNCATE).filter((change) => chunkDates.has(change.date));
   const freshChangeKeys = new Set(freshChanges.map(changeKey));
   const fetchedKeys = new Set(fetched.rows.map((row) => `${row.date}::${row.rateID}`));
   const alreadySmooth = chunk.changes
     .filter((change) => fetchedKeys.has(changeKey(change)) && !freshChangeKeys.has(changeKey(change)))
     .map((change) => ({ ...change, liveRate: null }));
   const drifted = [];
+
+  const priorTargetMap = new Map();
+  for (const runChunk of run.chunks) {
+    for (const change of runChunk.changes ?? []) {
+      priorTargetMap.set(`${nextDay(change.date)}::${change.rateID}`, change.proposedRate);
+    }
+  }
 
   for (const change of chunk.changes) {
     const liveRow = findLiveRow(fetched.rows, change);
@@ -2067,6 +2208,19 @@ async function assessChunkLiveState(run, chunk) {
         liveRate: null,
       });
       continue;
+    }
+    if (!ratesEqual(liveRow.currentRate, change.currentRate) && !ratesEqual(liveRow.currentRate, change.proposedRate)) {
+      // A live rate already at this row's own target is fine regardless of cause
+      // (our earlier partial write, or a spill that landed on the same value);
+      // flagging it would false-positive retries of partially applied chunks.
+      const priorTarget = priorTargetMap.get(`${change.date}::${change.rateID}`);
+      if (priorTarget !== undefined && ratesEqual(liveRow.currentRate, priorTarget)) {
+        drifted.push({
+          ...change,
+          liveRate: liveRow.currentRate,
+          reason: "Live rate matches the previous night's applied target; suspected adjacent-night spill.",
+        });
+      }
     }
   }
 
@@ -2236,6 +2390,7 @@ async function applyRun(id, options = {}) {
         chunk.draftId = created.draft.id;
         chunk.backupId = created.backup.id;
         chunk.status = "draft_created";
+        chunk.changes = draft.changes;
         chunk.changeCount = draft.changes.length;
         await saveRun(run);
       } else if (run.type === "rollback") {
@@ -2377,6 +2532,13 @@ async function applyRun(id, options = {}) {
   return run;
 }
 
+function resolveRuleQueryParam(value) {
+  const text = String(value ?? "truncate").trim().toLowerCase();
+  if (text === "truncate") return RULE_TRUNCATE;
+  if (text === "round49") return RULE_ROUND49;
+  throw new Error(`Unsupported rule "${value}"; use "truncate" or "round49".`);
+}
+
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 app.use(express.static(PUBLIC_DIR));
@@ -2401,6 +2563,9 @@ app.get("/api/config", (_req, res) => {
       minAllowedRate: MIN_ALLOWED_RATE,
       maxAllowedRate: MAX_ALLOWED_RATE,
       maxSmoothRateDecrease: MAX_SMOOTH_RATE_DECREASE,
+      maxParityRateDelta: MAX_PARITY_RATE_DELTA,
+      minRoomRateFloor: MIN_ROOM_RATE_FLOOR,
+      maxRoundRateDelta: MAX_ROUND_RATE_DELTA,
     },
   });
 });
@@ -2412,8 +2577,9 @@ app.get("/api/rates", async (req, res) => {
     const endDate = String(req.query.endDate ?? nextDay(startDate));
     assertDate(startDate, "startDate");
     assertDate(endDate, "endDate");
+    const rule = resolveRuleQueryParam(req.query.rule);
     const fetched = await fetchRatePlans(startDate, endDate, property);
-    const plannedChanges = plannedChangesFromRows(fetched.rows);
+    const plannedChanges = plannedChangesFromRows(fetched.rows, rule);
     const plannedChangeByKey = new Map(plannedChanges.map((change) => [changeKey(change), change]));
     res.json({
       propertyKey: property.key,
@@ -2421,10 +2587,11 @@ app.get("/api/rates", async (req, res) => {
       propertyName: property.propertyName,
       startDate,
       endDate,
+      rule,
       rows: fetched.rows.map(({ raw, ...row }) => ({
         ...row,
         targetByDefault: targetRowsForDraft(fetched.rows).some((target) => target.rateID === row.rateID && target.date === row.date),
-        proposedRate: plannedChangeByKey.get(`${row.date}::${row.rateID}`)?.proposedRate ?? smoothRate(row.currentRate),
+        proposedRate: plannedChangeByKey.get(`${row.date}::${row.rateID}`)?.proposedRate ?? targetRateForRule(row.currentRate, rule),
         parityGroupKey: plannedChangeByKey.get(`${row.date}::${row.rateID}`)?.parityGroupKey ?? null,
         parityRole: plannedChangeByKey.get(`${row.date}::${row.rateID}`)?.parityRole ?? null,
       })),
@@ -2442,14 +2609,16 @@ app.get("/api/parity-audit", async (req, res) => {
     assertDate(startDate, "startDate");
     assertDate(endDate, "endDate");
     assertFetchScope(startDate, endDate);
+    const rule = resolveRuleQueryParam(req.query.rule);
     const fetched = await fetchRatePlans(startDate, endDate, property);
-    const pairs = buildParityAudit(fetched.rows);
+    const pairs = buildParityAudit(fetched.rows, rule);
     res.json({
       propertyKey: property.key,
       propertyId: property.propertyId,
       propertyName: property.propertyName,
       startDate,
       endDate,
+      rule,
       summary: {
         pairCount: pairs.length,
         mismatchCount: pairs.filter((pair) => pair.status === "mismatch").length,
@@ -2473,7 +2642,8 @@ app.get("/api/drafts", async (_req, res) => {
 
 app.get("/api/runs", async (_req, res) => {
   try {
-    res.json({ runs: await listRuns() });
+    const includeArchived = String(_req.query.includeArchived ?? "false").toLowerCase() === "true";
+    res.json({ runs: await listRuns({ includeArchived }) });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -2591,6 +2761,18 @@ app.post("/api/runs/:id/spill-correction-draft", async (req, res) => {
   }
 });
 
+app.post("/api/runs/:id/archive", async (req, res) => {
+  try {
+    const run = await archiveRun(req.params.id, {
+      operator: req.body?.operator ?? "web-app",
+      reason: req.body?.reason ?? "",
+    });
+    res.json({ run });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
 app.post("/api/drafts/:id/apply", async (req, res) => {
   try {
     const draft = await applyDraft(req.params.id, req.body?.confirmation ?? "");
@@ -2607,7 +2789,11 @@ app.post("/api/drafts/:id/apply", async (req, res) => {
   }
 });
 
-app.use((_req, res) => {
+app.use((req, res) => {
+  if (req.path.startsWith("/api/")) {
+    res.status(404).json({ error: "Not found." });
+    return;
+  }
   res.sendFile(path.join(PUBLIC_DIR, "index.html"));
 });
 
@@ -2625,6 +2811,7 @@ function getDataDir() {
 export {
   app,
   applyRun,
+  archiveRun,
   createRateBackup,
   createRollbackRunFromRun,
   createRun,
@@ -2636,6 +2823,8 @@ export {
   reconcileRunVerification,
   resolveDefaultProperty,
   resolveProperty,
+  RULE_ROUND49,
+  RULE_TRUNCATE,
   startServer,
 };
 

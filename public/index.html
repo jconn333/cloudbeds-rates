@@ -29,6 +29,13 @@
           <label for="endDate">End night</label>
           <input id="endDate" type="date">
         </div>
+        <div class="field">
+          <label for="ruleSelect">Smoothing rule</label>
+          <select id="ruleSelect">
+            <option value="truncate">Truncate cents (current)</option>
+            <option value="round49">Round to 4/9 endings ($89 floor)</option>
+          </select>
+        </div>
         <div class="field grow">
           <label for="notes">Batch note</label>
           <input id="notes" type="text" placeholder="Optional note for audit trail">

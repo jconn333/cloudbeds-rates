@@ -55,3 +55,5 @@
 - Retrying a failed chunk automatically is acceptable only inside a tight evidence envelope: one post-apply failed chunk, draft and backup ids present, all applied/failed chunks backed up, untouched and adjacent verification clean, zero suspicious adjacent spill rows, and only small targeted whole-dollar smoothing mismatches. Outside that envelope, keep the run paused and notify.
 
 - Zero-change daily runs do not need full pre-apply backups because no Cloudbeds writes will occur; skipping those backups avoids hundreds of unnecessary read calls and shortens no-op days.
+
+- Skipped-only applied runs also do not have rollback-source chunk backups even when `totalChanges` is greater than zero. Rollback readiness should be required only when at least one chunk actually wrote rates and has a backup; stale unsafe paused runs should be archived as metadata, not deleted or retried, once later daily windows supersede them.

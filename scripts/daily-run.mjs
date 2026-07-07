@@ -16,6 +16,8 @@ import {
   listRuns,
   reconcileRunVerification,
   resolveProperty,
+  RULE_ROUND49,
+  RULE_TRUNCATE,
 } from "../server.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -33,6 +35,7 @@ Options:
   --end-date-limit <date>
                          Last inclusive night the daily runner may touch.
   --operator <name>      Operator label for run/audit history. Defaults to daily-run.
+  --rule <value>         Smoothing rule: truncate (default) or round49. Defaults to DAILY_RUN_RULE.
   --apply                Apply the planned run. Also requires ENABLE_CLOUDBEDS_WRITES=true.
   --skip-pre-apply-backup
                          Skip the full-scope backup created immediately before apply.
@@ -43,7 +46,24 @@ Options:
 `;
 }
 
+function envOrNull(value) {
+  const text = String(value ?? "").trim();
+  return text ? text : null;
+}
+
+function resolveRuleOption(value) {
+  const text = String(value ?? "truncate").trim().toLowerCase();
+  if (text === "truncate") return RULE_TRUNCATE;
+  if (text === "round49") return RULE_ROUND49;
+  throw new Error(`Unsupported rule "${value}"; use "truncate" or "round49".`);
+}
+
+function ruleOptionKind(value) {
+  return String(value ?? "truncate").trim().toLowerCase();
+}
+
 function parseArgs(argv) {
+  const startOffsetDaysEnv = envOrNull(process.env.DAILY_RUN_START_OFFSET_DAYS);
   const options = {
     apply: false,
     forceNew: false,
@@ -56,13 +76,12 @@ function parseArgs(argv) {
     autoRetryMaxChunks: Number(process.env.DAILY_RUN_AUTO_RETRY_MAX_CHUNKS ?? "2"),
     autoRetryMaxTargetedMismatches: Number(process.env.DAILY_RUN_AUTO_RETRY_MAX_TARGETED_MISMATCHES ?? "3"),
     properties: [],
-    startDate: process.env.DAILY_RUN_START_DATE ?? null,
-    startOffsetDays:
-      process.env.DAILY_RUN_START_OFFSET_DAYS === undefined
-        ? null
-        : Number(process.env.DAILY_RUN_START_OFFSET_DAYS),
+    startDate: envOrNull(process.env.DAILY_RUN_START_DATE),
+    startOffsetDays: startOffsetDaysEnv === null ? null : Number(startOffsetDaysEnv),
     daysAhead: Number(process.env.DAILY_RUN_DAYS_AHEAD ?? "365"),
-    endDateLimit: process.env.DAILY_RUN_END_DATE_LIMIT ?? null,
+    endDateLimit: envOrNull(process.env.DAILY_RUN_END_DATE_LIMIT),
+    ruleOption: envOrNull(process.env.DAILY_RUN_RULE) ?? "truncate",
+    notifyOnSuccess: String(process.env.DAILY_RUN_NOTIFY_ON_SUCCESS ?? "true").toLowerCase() !== "false",
   };
 
   for (let index = 0; index < argv.length; index += 1) {
@@ -95,6 +114,8 @@ function parseArgs(argv) {
       options.endDateLimit = next();
     } else if (arg === "--operator") {
       options.operator = next();
+    } else if (arg === "--rule") {
+      options.ruleOption = next();
     } else {
       throw new Error(`Unknown option: ${arg}`);
     }
@@ -126,6 +147,8 @@ function parseArgs(argv) {
   if (!Number.isInteger(options.autoRetryMaxTargetedMismatches) || options.autoRetryMaxTargetedMismatches <= 0) {
     throw new Error("DAILY_RUN_AUTO_RETRY_MAX_TARGETED_MISMATCHES must be a positive integer.");
   }
+  options.rule = resolveRuleOption(options.ruleOption);
+  options.ruleKind = ruleOptionKind(options.ruleOption);
 
   return options;
 }
@@ -155,7 +178,7 @@ function hasPostApplyVerificationFailure(run) {
 }
 
 function findPostApplyFailedChunk(run) {
-  return run.chunks.find((chunk) => ["verification_failed", "partial_apply_failed"].includes(chunk.status));
+  return run.chunks.find((chunk) => ["verification_failed", "partial_apply_failed", "apply_failed"].includes(chunk.status));
 }
 
 function isWholeDollar(value) {
@@ -327,6 +350,13 @@ async function verifyRollbackReadiness(appliedRun, operator) {
       message: `Rollback readiness not needed for ${appliedRun.id}; no rates changed.`,
     };
   }
+  const rollbackSourceChunks = appliedRun.chunks?.filter((chunk) => chunk.backupId) ?? [];
+  if (!rollbackSourceChunks.length) {
+    return {
+      needed: false,
+      message: `Rollback readiness not needed for ${appliedRun.id}; no rate-write backups exist because all changes were already smooth or skipped.`,
+    };
+  }
 
   const rollbackRun = await createRollbackRunFromRun(appliedRun.id, `${operator}-rollback-readiness`, {
     readinessOnly: true,
@@ -485,7 +515,7 @@ async function runProperty(propertyKey, options) {
     endDate = options.endDateLimit;
   }
   const automationDate = new Date().toISOString().slice(0, 10);
-  const automationKey = `daily-smooth:${automationDate}:${property.key}:${startDate}:${endDate}`;
+  const automationKey = `daily-smooth:${automationDate}:${property.key}:${startDate}:${endDate}:${options.ruleKind}`;
   const offsetNote = options.startOffsetDays === null ? "default-start=tomorrow" : `start-offset-days=${options.startOffsetDays}`;
   const limitNote = options.endDateLimit ? `; end-date-limit=${options.endDateLimit}` : "";
   const notes = `daily-run ${automationDate}; property=${property.key}; window=${startDate}..${endDate}; ${offsetNote}${limitNote}`;
@@ -502,6 +532,7 @@ async function runProperty(propertyKey, options) {
         operator: options.operator,
         notes,
         automationKey,
+        rule: options.rule,
       });
       console.log(`Created run ${run.id}: ${summarize(run)}.`);
     }
@@ -559,9 +590,15 @@ async function main() {
 
   await initializeStorage();
   const results = [];
+  let failure = null;
 
   for (const propertyKey of options.properties) {
-    results.push(await runProperty(propertyKey, options));
+    try {
+      results.push(await runProperty(propertyKey, options));
+    } catch (error) {
+      failure = { propertyKey, error };
+      break;
+    }
   }
 
   const lines = results.map(({ run, applied, rollbackReadiness, preApplyBackup, skipped, message }) => {
@@ -570,18 +607,29 @@ async function main() {
     const rollbackText = rollbackReadiness ? `; ${rollbackReadiness.message}` : "";
     return `${applied ? "APPLIED" : "PLANNED"} ${run.id}: ${summarize(run)}${backupText}${rollbackText}`;
   });
-  const message = `Cloudbeds daily run ${options.apply ? "apply" : "plan"} completed.\n${lines.join("\n")}`;
-  console.log(message);
-  await postNotification(message).catch((error) => {
-    console.error(`Notification failed after successful daily run: ${error.message}`);
-  });
+  if (failure) lines.push(`FAILED ${failure.propertyKey}: ${failure.error.message}`);
+
+  const message = `Cloudbeds daily run ${options.apply ? "apply" : "plan"} ${failure ? "failed" : "completed"}.\n${lines.join("\n")}`;
+  if (failure) console.error(message);
+  else console.log(message);
+  if (failure || options.notifyOnSuccess) {
+    await postNotification(message).catch((error) => {
+      console.error(`Notification failed after daily run: ${error.message}`);
+    });
+  }
+
+  if (failure) {
+    failure.error.dailyRunNotified = true;
+    throw failure.error;
+  }
 }
 
 main().catch(async (error) => {
+  process.exitCode = 1;
+  if (error.dailyRunNotified) return;
   const message = `Cloudbeds daily run failed: ${error.message}`;
   console.error(message);
   await postNotification(message).catch((notifyError) => {
     console.error(`Notification failed: ${notifyError.message}`);
   });
-  process.exitCode = 1;
 });
