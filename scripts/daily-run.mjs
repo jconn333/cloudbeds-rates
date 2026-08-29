@@ -305,10 +305,13 @@ async function postNotification(text) {
   const url = process.env.DAILY_RUN_WEBHOOK_URL;
   if (!url) return;
 
+  // Distinct prefix so smoother alerts stand out from Pricey Pro watchdog
+  // noise in the shared channel — five weeks of failures went unnoticed
+  // without it (Jul–Aug 2026).
   const response = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ text }),
+    body: JSON.stringify({ text: `🛏️ Rate smoother: ${text}` }),
   });
   if (!response.ok) {
     throw new Error(`Daily-run notification failed with HTTP ${response.status}.`);
