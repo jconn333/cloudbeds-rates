@@ -593,16 +593,18 @@ async function main() {
 
   await initializeStorage();
   const results = [];
-  let failure = null;
+  const failures = [];
 
+  // Properties are independent (own runs, locks, and data), so one property's failure must not
+  // block the rest — on 2026-09-22/23 an Encore failure left Berlin Resort unpriced for two days.
   for (const propertyKey of options.properties) {
     try {
       results.push(await runProperty(propertyKey, options));
     } catch (error) {
-      failure = { propertyKey, error };
-      break;
+      failures.push({ propertyKey, error });
     }
   }
+  const failure = failures[0] ?? null;
 
   const lines = results.map(({ run, applied, rollbackReadiness, preApplyBackup, skipped, message }) => {
     if (skipped) return `SKIPPED: ${message}`;
@@ -610,7 +612,7 @@ async function main() {
     const rollbackText = rollbackReadiness ? `; ${rollbackReadiness.message}` : "";
     return `${applied ? "APPLIED" : "PLANNED"} ${run.id}: ${summarize(run)}${backupText}${rollbackText}`;
   });
-  if (failure) lines.push(`FAILED ${failure.propertyKey}: ${failure.error.message}`);
+  for (const { propertyKey, error } of failures) lines.push(`FAILED ${propertyKey}: ${error.message}`);
 
   const message = `Cloudbeds daily run ${options.apply ? "apply" : "plan"} ${failure ? "failed" : "completed"}.\n${lines.join("\n")}`;
   if (failure) console.error(message);

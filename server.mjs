@@ -621,7 +621,17 @@ async function cloudbeds(method, params = {}, init = {}, propertyContext = resol
       for (const [key, value] of Object.entries(params)) {
         if (value !== undefined && value !== null) url.searchParams.set(key, String(value));
       }
-      response = await fetch(url, { headers });
+      try {
+        response = await fetch(url, { headers });
+      } catch (error) {
+        // Reads are safe to repeat; a dropped connection shouldn't kill a 365-night backup.
+        if (attempt < 4) {
+          console.warn(`Cloudbeds GET ${method} network error (attempt ${attempt + 1}/5), retrying: ${error.message}`);
+          await wait(1000 * 2 ** attempt);
+          continue;
+        }
+        throw error;
+      }
     }
 
     const text = await response.text();
@@ -635,7 +645,13 @@ async function cloudbeds(method, params = {}, init = {}, propertyContext = resol
     const rateLimited = response.status === 429 || /rate limit/i.test(String(message));
 
     if (response.ok && json.success !== false) return json;
-    if ((requestMethod === "GET" || (requestMethod === "POST" && response.status === 429)) && rateLimited && attempt < 4) {
+    // Cloudbeds returns sporadic failures on reads (e.g. a one-off "Invalid User" on 2026-09-23 that
+    // killed the whole daily run mid-backup while the same key read fine before and after), so any
+    // failed GET is retried. Writes are only retried on an explicit 429 so a write is never sent twice.
+    if ((requestMethod === "GET" || (requestMethod === "POST" && response.status === 429)) && attempt < 4) {
+      if (requestMethod === "GET" && !rateLimited) {
+        console.warn(`Cloudbeds GET ${method} failed (attempt ${attempt + 1}/5), retrying: ${message}`);
+      }
       await wait(1000 * 2 ** attempt);
       continue;
     }
