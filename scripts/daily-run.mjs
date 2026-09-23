@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import "dotenv/config";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -302,19 +303,63 @@ async function withLock(name, fn) {
 }
 
 async function postNotification(text) {
-  const url = process.env.DAILY_RUN_WEBHOOK_URL;
-  if (!url) return;
-
   // Distinct prefix so smoother alerts stand out from Pricey Pro watchdog
   // noise in the shared channel — five weeks of failures went unnoticed
   // without it (Jul–Aug 2026).
+  const body = `🛏️ Rate smoother: ${text}`;
+  if (process.env.DAILY_RUN_PINGO_CHANNEL_ID) return postPingo(body);
+
+  const url = process.env.DAILY_RUN_WEBHOOK_URL;
+  if (!url) return;
   const response = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ text: `🛏️ Rate smoother: ${text}` }),
+    body: JSON.stringify({ text: body }),
   });
   if (!response.ok) {
     throw new Error(`Daily-run notification failed with HTTP ${response.status}.`);
+  }
+}
+
+// Pingo is the alert channel since Discord/Slack were retired (Aug 2026). Posts as the Zeke bot using
+// the Mini bridge's credentials, verifies sender + destination first and reads the message back after,
+// the same contract as website-health.
+async function postPingo(body) {
+  const envFile = process.env.DAILY_RUN_PINGO_ENV_FILE ?? path.join(process.env.HOME ?? "", ".pingo-claude-bridge/env");
+  const creds = Object.fromEntries(
+    (await fs.readFile(envFile, "utf8"))
+      .split("\n")
+      .filter((line) => line.includes("=") && !line.trim().startsWith("#"))
+      .map((line) => [line.slice(0, line.indexOf("=")).trim(), line.slice(line.indexOf("=") + 1).trim().replace(/^['"]|['"]$/g, "")])
+  );
+  const api = async (route, payload) => {
+    const response = await fetch(`${creds.PINGO_API_URL.replace(/\/+$/, "")}${route}`, {
+      method: payload ? "POST" : "GET",
+      headers: { Authorization: `Bearer ${creds.PINGO_API_KEY}`, "content-type": "application/json" },
+      body: payload ? JSON.stringify(payload) : undefined,
+    });
+    if (!response.ok) throw new Error(`Pingo ${route} failed with HTTP ${response.status}.`);
+    return response.json();
+  };
+
+  const channelId = process.env.DAILY_RUN_PINGO_CHANNEL_ID;
+  const me = await api("/v1/me");
+  if (!me.is_bot || (process.env.DAILY_RUN_PINGO_SENDER_ID && me.id !== process.env.DAILY_RUN_PINGO_SENDER_ID)) {
+    throw new Error("Pingo sender verification failed.");
+  }
+  const channel = (await api("/v1/channels")).channels?.find((c) => c.id === channelId);
+  const expectedName = process.env.DAILY_RUN_PINGO_CHANNEL_NAME;
+  if (!channel || !channel.is_member || channel.archived_at || (expectedName && channel.name !== expectedName)) {
+    throw new Error("Pingo destination verification failed.");
+  }
+
+  const text = body.slice(0, 11800);
+  const day = new Date().toISOString().slice(0, 10);
+  const idempotencyKey = `rate-smoother-${day}-${createHash("sha256").update(text).digest("hex").slice(0, 16)}`;
+  const { message } = await api("/v1/messages", { channel_id: channelId, body: text, idempotency_key: idempotencyKey });
+  const recent = await api(`/v1/channels/${channelId}/messages?limit=100`);
+  if (!recent.messages?.some((m) => m.id === message.id && m.user_id === me.id)) {
+    throw new Error("Pingo delivery readback failed.");
   }
 }
 
